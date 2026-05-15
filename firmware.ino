@@ -1,1463 +1,259 @@
 // ======================================================
-// XIAO ML KIT (OR XIAO ESP32S3 SENSE)
-// FULL VISION ML — REGRESSION HEAD — v001
+// on-device-regression-v003 — CHANGE NOTES AND SURGICAL DIFFS
 //
-// Predicts a continuous distance value from camera images.
-// Two output neurons:
-//   [0] distance  — linear activation, normalized 0.0–1.0 (can exceed 1.0 for extrapolation)
-//   [1] confidence — sigmoid activation, 0.0 = no object, 1.0 = object present
+// Three independent changes.  Apply all three for best extrapolation.
+// Each change is labelled CHANGE-1 / CHANGE-2 / CHANGE-3.
+// Search for the OLD block in your v002 file, replace with the NEW block.
+// Nothing else in the file is touched.
 //
-// SD card stores: images in class folders (/images/0Blank/, /images/2/, /images/5/, /images/10/)
-// SD card stores: weights in binary and .h text char array format
-// Serial monitor and OLED output
+// Summary of what v002 still got wrong and why extrapolation was capped:
 //
-// Based on on-device-classification v44 by Jeremy Ellis.
-// Regression head and dual-output loss by Jeremy Ellis.
-// With free tier assistance from: Claude (code overview), ChatGPT (Critique),
-//   Gemini (Research) and Copilot (Alternate)
-// Use at your own risk!
-// MIT license
+//   ISSUE-1: Blank-class distance target was 0.5f.
+//     Every blank image pulled myOutput_b[0] toward 0.5 during training.
+//     With many blank images the distance head is anchored well below 1.0,
+//     so even the top label settles near 0.9–0.95 rather than above 1.0.
+//     Fix: change the blank distance target to 0.0f (object is absent,
+//     distance is irrelevant — anchor it at zero, not the midpoint).
 //
-// Github Profile https://github.com/hpssjellis
-// LinkedIn https://www.linkedin.com/in/jeremy-ellis-4237a9bb/
+//   ISSUE-2: The output bias is warm-started at 0.5f (line 458).
+//     That is a sensible midpoint init for a 0–1 range, but combined
+//     with ISSUE-1 it double-anchors the head below 1.0.
+//     Fix: init myOutput_b[0] = 0.9f — closer to the top training target.
+//     This shortens the distance the optimiser must travel during training
+//     and leaves more headroom above 1.0 at convergence.
 //
-// For platformio you need the U8g2 library declared in the platformio.ini file and OPI PSRAM set
-// lib_deps =  olikraus/U8g2 @ ^2.35.30
-// ; Overriding defaults to enable OPI PSRAM
-// build_flags =
-//    -DBOARD_HAS_PSRAM
-//    -DARDUINO_USB_CDC_ON_BOOT=1
-// board_build.arduino.memory_type = qio_opi
-// board_build.flash_mode = qio
-// board_upload.flash_size = 8MB
-//
-// ======================================================
-// KEY DIFFERENCES FROM v44 CLASSIFICATION:
-//
-//  1. REGRESSION CONFIG block replaces NUM_CLASSES + myClassLabels[]
-//     myDistTarget[], myDistLabel[], myDistUnit, myDistMax are the
-//     only things a student needs to change for different distances/units.
-//
-//  2. OUTPUT LAYER: 2 neurons instead of NUM_CLASSES neurons.
-//     myOutput[0] = distance  (linear activation — no sigmoid/softmax)
-//     myOutput[1] = confidence (sigmoid activation)
-//
-//  3. LOSS FUNCTION: MSE on distance + BCE on confidence
-//     (replaces softmax cross-entropy)
-//
-//  4. BACKWARD PASS for output layer: simpler than classification.
-//     MSE gradient = 2*(pred-target), linear activation deriv = 1.
-//     BCE gradient for sigmoid confidence = (pred - target).
-//
-//  5. INFERENCE OUTPUT: reports numeric distance + confidence %
-//     instead of argmax class name. Reports extrapolated values > 1.0.
-//
-//  6. WEIGHT FILE: same binary format, compatible with same SD paths.
-//     Not cross-compatible with classification weights (different output size).
+//   ISSUE-3: No calibration — the raw output is multiplied by myDistMax
+//     (10.0f) which assumes the network reliably reaches exactly 1.0 for
+//     the farthest class.  In practice it reaches ~0.92–0.97, so
+//     "10 cm" reads as "9.2–9.7 cm" and anything beyond is suppressed.
+//     Fix: after training, run a one-shot calibration pass over the
+//     validation (or all training) images, record the mean raw myDistPred
+//     for each distance class, then fit a least-squares line through those
+//     (rawPred, realDist_cm) anchor points.  At inference, apply
+//       myCalibratedDist = myCalibSlope * myDistPred + myCalibOffset
+//     instead of myDistPred * myDistMax.
+//     The fitted line naturally extrapolates beyond the training maximum.
 //
 // ======================================================
 
 
-// ██████████████████████████████████████████████████████████████████████████████
-// ██                                                                          ██
-// ██  PART 0: CORE SYSTEM (ALWAYS INCLUDED)                                   ██
-// ██  Headers, Defines, Pins, Globals, Memory, Weights, Setup, Loop           ██
-// ██                                                                          ██
-// ██████████████████████████████████████████████████████████████████████████████
-
-
-// Uncomment AFTER copying myWeights.h from SD to your sketch folder:
-//#define USE_BAKED_WEIGHTS
-
-#ifdef USE_BAKED_WEIGHTS
-  #include "myWeights.h"
-#endif
-
-#include "esp_camera.h"
-#include "img_converters.h"
-#include "FS.h"
-#include "SD.h"
-#include "SPI.h"
-#include <vector>
-#include <algorithm>
-#include <U8g2lib.h>
-#include <Wire.h>
-
-U8G2_SSD1306_72X40_ER_1_HW_I2C u8g2(U8G2_R2, U8X8_PIN_NONE);
-
-// ======================================================
-// REGRESSION CONFIGURATION
-// ======================================================
-// Distances are normalized so your maximum real-world distance = 1.0
-// To change distances: edit myDistTarget[] and myDistLabel[] in parallel.
-// To change units: edit myDistUnit and myDistMax.
-// The 0Blank folder is always index 0 — do not add a target for it.
-//
-// Example — feet at 1ft, 3ft, 8ft (max=8ft):
-//   myDistTarget = {0.125f, 0.375f, 1.0f}
-//   myDistLabel  = {"1", "3", "8"}
-//   myDistUnit   = "feet"
-//   myDistMax    = 8.0f
-// ======================================================
-
-#define NUM_DIST_CLASSES 3                        // number of distance classes (NOT counting blank)
-#define TOTAL_CLASSES    (NUM_DIST_CLASSES + 1)   // +1 for 0Blank; used for menu sizing
-
-// Normalized distance targets: index matches SD folder order after 0Blank.
-// Maximum real-world distance always maps to 1.0.
-// You can change 0.5f to 0.3f here if your middle distance is 3 not 5.
-const float myDistTarget[NUM_DIST_CLASSES] = {0.2f, 0.5f, 1.0f};
-
-// Human-readable distance values shown on serial and OLED
-String myDistLabel[NUM_DIST_CLASSES] = {"2", "5", "10"};
-
-// Unit string shown on serial/OLED (purely cosmetic)
-const String myDistUnit = "cm";
-
-// Real-world maximum distance — used to de-normalize at inference time.
-// Output distance = myDistPred * myDistMax  (can exceed myDistMax if extrapolating)
-const float myDistMax = 10.0f;
-
-// Confidence threshold: below this the device reports "No object"
-const float myConfThreshold = 0.5f;
-
-// Output neuron clip range DURING TRAINING.
-// Upper bound deliberately > 1.0 so the linear head can extrapolate.
-// Lower bound slightly negative to avoid dead-zone at zero.
-const float myDistClipMin = -0.1f;
-const float myDistClipMax =  1.5f;
-
-// SD folder names — index 0 is always blank, then one per distance class
-// These must match the actual folder names you create on the SD card.
-String myClassLabels[TOTAL_CLASSES] = {"0Blank", "2", "5", "10"};
-
-// Loss weighting: confidence BCE term is scaled by this factor.
-// Increase if the model ignores the confidence head; decrease if distance is noisy.
-const float myConfLossWeight = 0.5f;
-
-// ======================================================
-// HYPERPARAMETERS
-// ======================================================
-float LEARNING_RATE   = 0.0003f;
-int   BATCH_SIZE      = 6;
-int   TARGET_EPOCHS   = 20;
-int   VALIDATION_IMAGES = 3;   // last N images per class held out for validation (0 = disabled)
-
-// ======================================================
-// TOUCH THRESHOLDS
-// ======================================================
-const int myThresholdPress   = 1100;
-const int myThresholdRelease =  900;
-
-// ======================================================
-// UNIFIED TOUCH INPUT SYSTEM
-// ======================================================
-struct TouchState {
-  bool isTouching          = false;
-  int  tapCount            = 0;
-  unsigned long firstTapTime    = 0;
-  unsigned long lastReleaseTime = 0;
-  unsigned long lastCheckTime   = 0;
-  const unsigned long tapWindow    = 800;
-  const int           longPressTaps = 3;
-  const unsigned long debounceDelay = 50;
-};
-
-TouchState myTouch;
-
-// SYSTEM LOGIC VARIABLES
-unsigned long myLastActivityTime = 0;
-unsigned long myLastTapTime      = 0;
-const int     myTapCooldown      = 250;
-int           myMenuIndex        = 1;
-bool          myIsSelected       = false;
-bool          myWeightsTrained   = false;
-
-// ======================================================
-// MENU SIZING
-// Total menu items = TOTAL_CLASSES (collect one per folder) + Train + Infer
-// ======================================================
-const int myTotalItems = TOTAL_CLASSES + 2;
-
-// ======================================================
-// XIAO ESP32-S3 CAMERA PINS
-// ======================================================
-#define PWDN_GPIO_NUM     -1
-#define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM     10
-#define SIOD_GPIO_NUM     40
-#define SIOC_GPIO_NUM     39
-#define Y9_GPIO_NUM       48
-#define Y8_GPIO_NUM       11
-#define Y7_GPIO_NUM       12
-#define Y6_GPIO_NUM       14
-#define Y5_GPIO_NUM       16
-#define Y4_GPIO_NUM       18
-#define Y3_GPIO_NUM       17
-#define Y2_GPIO_NUM       15
-#define VSYNC_GPIO_NUM    38
-#define HREF_GPIO_NUM     47
-#define PCLK_GPIO_NUM     13
-
-// ======================================================
-// CONFIGURABLE INPUT RESOLUTION
-// ======================================================
-#define INPUT_SIZE 64
-
-// ======================================================
-// CNN ARCHITECTURE CONSTANTS (unchanged from v44)
-// ======================================================
-#define CONV1_KERNEL_SIZE 3
-#define CONV1_FILTERS     4
-#define CONV1_WEIGHTS     (CONV1_KERNEL_SIZE * CONV1_KERNEL_SIZE * 3 * CONV1_FILTERS)
-
-#define CONV2_KERNEL_SIZE 3
-#define CONV2_FILTERS     8
-#define CONV2_WEIGHTS     (CONV2_KERNEL_SIZE * CONV2_KERNEL_SIZE * CONV1_FILTERS * CONV2_FILTERS)
-
-#define CONV1_OUTPUT_SIZE (INPUT_SIZE - 2)
-#define POOL1_OUTPUT_SIZE (CONV1_OUTPUT_SIZE / 2)
-#define CONV2_OUTPUT_SIZE (POOL1_OUTPUT_SIZE - 2)
-#define FLATTENED_SIZE    (CONV2_OUTPUT_SIZE * CONV2_OUTPUT_SIZE * CONV2_FILTERS)
-
-// ======================================================
-// REGRESSION OUTPUT CONSTANTS
-// 2 output neurons: [0]=distance (linear), [1]=confidence (sigmoid)
-// ======================================================
-#define REG_OUTPUTS     2                        // always 2: distance + confidence
-#define OUTPUT_WEIGHTS  (FLATTENED_SIZE * REG_OUTPUTS)
-
-// ======================================================
-// GLOBAL VARIABLE DEFINITIONS
-// ======================================================
-uint8_t* myRgbBuffer = nullptr;
-bool     mySDavailable = false;
-
-// ML weight buffers (PSRAM)
-float* myInputBuffer  = nullptr;
-float* myConv1_w      = nullptr;
-float* myConv1_b      = nullptr;
-float* myConv2_w      = nullptr;
-float* myConv2_b      = nullptr;
-float* myOutput_w     = nullptr;   // [REG_OUTPUTS][FLATTENED_SIZE]
-float* myOutput_b     = nullptr;   // [REG_OUTPUTS]
-
-// Gradient accumulator buffers
-float* myConv1_w_grad  = nullptr;
-float* myConv1_b_grad  = nullptr;
-float* myConv2_w_grad  = nullptr;
-float* myConv2_b_grad  = nullptr;
-float* myOutput_w_grad = nullptr;
-float* myOutput_b_grad = nullptr;
-
-// Adam optimizer momentum buffers
-float* myConv1_w_m  = nullptr;  float* myConv1_w_v  = nullptr;
-float* myConv1_b_m  = nullptr;  float* myConv1_b_v  = nullptr;
-float* myConv2_w_m  = nullptr;  float* myConv2_w_v  = nullptr;
-float* myConv2_b_m  = nullptr;  float* myConv2_b_v  = nullptr;
-float* myOutput_w_m = nullptr;  float* myOutput_w_v = nullptr;
-float* myOutput_b_m = nullptr;  float* myOutput_b_v = nullptr;
-
-// Forward pass buffers
-float* myConv1_output = nullptr;
-float* myPool1_output = nullptr;
-float* myConv2_output = nullptr;
-float  myRegOutput[REG_OUTPUTS];   // small fixed array: [0]=dist raw, [1]=conf raw (pre-activation)
-float  myDistPred  = 0.0f;         // post-activation distance  (linear: same as myRegOutput[0])
-float  myConfPred  = 0.0f;         // post-activation confidence (sigmoid of myRegOutput[1])
-
-// Backward pass buffers
-float* myDense_grad = nullptr;
-float* myConv2_grad = nullptr;
-float* myPool1_grad = nullptr;
-float* myConv1_grad = nullptr;
-
-struct TrainingItem {
-  String path;
-  int    label;   // 0 = blank, 1..NUM_DIST_CLASSES = distance class index
-};
-std::vector<TrainingItem> myTrainingData;
-
-// ======================================================
-// UTILITY FUNCTIONS
-// ======================================================
-inline float clip_value(float v, float mn = -100.0f, float mx = 100.0f) {
-  if (isnan(v) || isinf(v)) return 0.0f;
-  return constrain(v, mn, mx);
-}
-
-inline float leaky_relu(float x)       { return x > 0.0f ? x : 0.1f * x; }
-inline float leaky_relu_deriv(float x) { return x > 0.0f ? 1.0f : 0.1f; }
-
-inline float my_sigmoid(float x)       { return 1.0f / (1.0f + expf(-x)); }
-// sigmoid derivative in terms of the already-computed sigmoid output s
-inline float my_sigmoid_deriv(float s) { return s * (1.0f - s); }
-
-// ======================================================
-// UNIFIED TOUCH INPUT FUNCTIONS (unchanged from v44)
-// ======================================================
-int myReadTouch() {
-  int sum = 0;
-  for (int i = 0; i < 3; i++) { sum += analogRead(A0); delayMicroseconds(100); }
-  return sum / 3;
-}
-
-void myResetTouchState() {
-  myTouch.isTouching     = false;
-  myTouch.tapCount       = 0;
-  myTouch.firstTapTime   = 0;
-  myTouch.lastReleaseTime = 0;
-  myTouch.lastCheckTime  = 0;
-}
-
-void myUpdateTouchState() {
-  unsigned long now = millis();
-  if (now - myTouch.lastCheckTime < 20) return;
-  myTouch.lastCheckTime = now;
-  int  val         = myReadTouch();
-  bool touchActive = myTouch.isTouching ? (val > myThresholdRelease) : (val > myThresholdPress);
-  if (touchActive && !myTouch.isTouching) {
-    if (now - myTouch.lastReleaseTime < myTouch.debounceDelay) return;
-    myTouch.isTouching = true;
-    if (myTouch.tapCount == 0 || (now - myTouch.firstTapTime < myTouch.tapWindow)) {
-      if (myTouch.tapCount == 0) myTouch.firstTapTime = now;
-      myTouch.tapCount++;
-      Serial.printf("Tap #%d\n", myTouch.tapCount);
-    } else {
-      myTouch.tapCount = 1;
-      myTouch.firstTapTime = now;
-      Serial.println("Tap #1 (new window)");
-    }
-  }
-  if (!touchActive && myTouch.isTouching) {
-    myTouch.isTouching      = false;
-    myTouch.lastReleaseTime = now;
-  }
-}
-
-int myCheckTouchInput() {
-  myUpdateTouchState();
-  unsigned long now = millis();
-  if (myTouch.tapCount > 0 && !myTouch.isTouching) {
-    if (now - myTouch.firstTapTime > myTouch.tapWindow) {
-      int result = (myTouch.tapCount >= myTouch.longPressTaps) ? 2 : 1;
-      int count  = myTouch.tapCount;
-      myResetTouchState();
-      if (result == 2) Serial.printf("LONG PRESS detected (%d taps)\n", count);
-      else             Serial.printf("TAP detected (%d tap%s)\n", count, count > 1 ? "s" : "");
-      return result;
-    }
-  }
-  return 0;
-}
-
-void myCheckTouchBackground() { myUpdateTouchState(); }
-
-int myPeekTouchAction() {
-  myUpdateTouchState();
-  unsigned long now = millis();
-  if (myTouch.tapCount > 0 && !myTouch.isTouching) {
-    if (now - myTouch.firstTapTime > myTouch.tapWindow)
-      return (myTouch.tapCount >= myTouch.longPressTaps) ? 2 : 1;
-  }
-  return 0;
-}
-
-// ======================================================
-// MEMORY ALLOCATION
-// ======================================================
-void myAllocateMemory() {
-  if (myInputBuffer != nullptr) return;
-  Serial.println("\n=== Allocating Memory ===");
-
-  myInputBuffer  = (float*)ps_malloc(INPUT_SIZE * INPUT_SIZE * 3 * sizeof(float));
-  myConv1_w      = (float*)ps_malloc(CONV1_WEIGHTS  * sizeof(float));
-  myConv1_b      = (float*)ps_malloc(CONV1_FILTERS  * sizeof(float));
-  myConv2_w      = (float*)ps_malloc(CONV2_WEIGHTS  * sizeof(float));
-  myConv2_b      = (float*)ps_malloc(CONV2_FILTERS  * sizeof(float));
-  myOutput_w     = (float*)ps_malloc(OUTPUT_WEIGHTS * sizeof(float));
-  myOutput_b     = (float*)ps_malloc(REG_OUTPUTS    * sizeof(float));
-
-  myConv1_w_grad  = (float*)ps_malloc(CONV1_WEIGHTS  * sizeof(float));
-  myConv1_b_grad  = (float*)ps_malloc(CONV1_FILTERS  * sizeof(float));
-  myConv2_w_grad  = (float*)ps_malloc(CONV2_WEIGHTS  * sizeof(float));
-  myConv2_b_grad  = (float*)ps_malloc(CONV2_FILTERS  * sizeof(float));
-  myOutput_w_grad = (float*)ps_malloc(OUTPUT_WEIGHTS * sizeof(float));
-  myOutput_b_grad = (float*)ps_malloc(REG_OUTPUTS    * sizeof(float));
-
-  myConv1_w_m  = (float*)ps_calloc(CONV1_WEIGHTS,  sizeof(float));
-  myConv1_w_v  = (float*)ps_calloc(CONV1_WEIGHTS,  sizeof(float));
-  myConv1_b_m  = (float*)ps_calloc(CONV1_FILTERS,  sizeof(float));
-  myConv1_b_v  = (float*)ps_calloc(CONV1_FILTERS,  sizeof(float));
-  myConv2_w_m  = (float*)ps_calloc(CONV2_WEIGHTS,  sizeof(float));
-  myConv2_w_v  = (float*)ps_calloc(CONV2_WEIGHTS,  sizeof(float));
-  myConv2_b_m  = (float*)ps_calloc(CONV2_FILTERS,  sizeof(float));
-  myConv2_b_v  = (float*)ps_calloc(CONV2_FILTERS,  sizeof(float));
-  myOutput_w_m = (float*)ps_calloc(OUTPUT_WEIGHTS,  sizeof(float));
-  myOutput_w_v = (float*)ps_calloc(OUTPUT_WEIGHTS,  sizeof(float));
-  myOutput_b_m = (float*)ps_calloc(REG_OUTPUTS,     sizeof(float));
-  myOutput_b_v = (float*)ps_calloc(REG_OUTPUTS,     sizeof(float));
-
-  myConv1_output = (float*)ps_malloc(CONV1_OUTPUT_SIZE * CONV1_OUTPUT_SIZE * CONV1_FILTERS * sizeof(float));
-  myPool1_output = (float*)ps_malloc(POOL1_OUTPUT_SIZE * POOL1_OUTPUT_SIZE * CONV1_FILTERS * sizeof(float));
-  myConv2_output = (float*)ps_malloc(CONV2_OUTPUT_SIZE * CONV2_OUTPUT_SIZE * CONV2_FILTERS * sizeof(float));
-
-  myDense_grad  = (float*)ps_malloc(FLATTENED_SIZE                              * sizeof(float));
-  myConv2_grad  = (float*)ps_malloc(CONV2_OUTPUT_SIZE * CONV2_OUTPUT_SIZE * CONV2_FILTERS * sizeof(float));
-  myPool1_grad  = (float*)ps_malloc(POOL1_OUTPUT_SIZE * POOL1_OUTPUT_SIZE * CONV1_FILTERS * sizeof(float));
-  myConv1_grad  = (float*)ps_malloc(CONV1_OUTPUT_SIZE * CONV1_OUTPUT_SIZE * CONV1_FILTERS * sizeof(float));
-
-  if (!myInputBuffer || !myConv1_w || !myConv2_w || !myOutput_w ||
-      !myConv1_output || !myPool1_output || !myConv2_output || !myDense_grad) {
-    Serial.println("FATAL: PSRAM allocation failed!");
-    u8g2.firstPage();
-    do { u8g2.drawStr(0, 15, "PSRAM ERROR!"); } while (u8g2.nextPage());
-    while (1) { delay(1000); }
-  }
-
-  Serial.printf("Free PSRAM after allocation: %d bytes\n", ESP.getFreePsram());
-
-  // He initialization for conv layers (unchanged from v44)
-  float c1std = sqrtf(2.0f / (9.0f * 3.0f));
-  for (int i = 0; i < CONV1_WEIGHTS; i++)
-    myConv1_w[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f * c1std;
-  for (int i = 0; i < CONV1_FILTERS; i++) myConv1_b[i] = 0.0f;
-
-  float c2std = sqrtf(2.0f / (9.0f * (float)CONV1_FILTERS));
-  for (int i = 0; i < CONV2_WEIGHTS; i++)
-    myConv2_w[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f * c2std;
-  for (int i = 0; i < CONV2_FILTERS; i++) myConv2_b[i] = 0.0f;
-
-  // He init for regression output layer — fan_in = FLATTENED_SIZE
-  float dstd = sqrtf(2.0f / (float)FLATTENED_SIZE);
-  for (int i = 0; i < OUTPUT_WEIGHTS; i++)
-    myOutput_w[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f * dstd;
-  // Bias init: distance head starts at 0.5 (midpoint), confidence at 0
-  myOutput_b[0] = 0.5f;   // distance neuron bias — warm-start near midpoint
-  myOutput_b[1] = 0.0f;   // confidence neuron bias
-
-  Serial.println("He-init random weights set");
-}
-
-// ======================================================
-// WEIGHT SAVE / LOAD / EXPORT
-// Compatible binary format with v44 EXCEPT output layer size changed.
-// (REG_OUTPUTS=2 replaces NUM_CLASSES — do not mix regression/classification weights)
-// ======================================================
-void myExportHeader() {
-  if (!mySDavailable) { Serial.println("No SD card - cannot export header"); return; }
-  if (!SD.exists("/header")) SD.mkdir("/header");
-  File file = SD.open("/header/myWeights.h", FILE_WRITE);
-  if (!file) return;
-  file.println("#ifndef MY_MODEL_H\n#define MY_MODEL_H");
-  file.println("// Regression model — v001");
-  file.printf( "// NUM_DIST_CLASSES %d  REG_OUTPUTS %d\n", NUM_DIST_CLASSES, REG_OUTPUTS);
-  file.println("// To use: copy to sketch folder, uncomment #define USE_BAKED_WEIGHTS");
-  auto myDump = [&](const char* name, float* data, int size) {
-    file.printf("const float %s[] = { ", name);
-    for (int i = 0; i < size; i++) {
-      file.print(data[i], 6); file.print("f");
-      if (i < size - 1) file.print(", ");
-      if ((i + 1) % 8 == 0) file.println();
-    }
-    file.println(" };");
-  };
-  myDump("myModel_conv1_w",  myConv1_w,  CONV1_WEIGHTS);
-  myDump("myModel_conv1_b",  myConv1_b,  CONV1_FILTERS);
-  myDump("myModel_conv2_w",  myConv2_w,  CONV2_WEIGHTS);
-  myDump("myModel_conv2_b",  myConv2_b,  CONV2_FILTERS);
-  myDump("myModel_output_w", myOutput_w, OUTPUT_WEIGHTS);
-  myDump("myModel_output_b", myOutput_b, REG_OUTPUTS);
-  file.println("#endif");
-  file.close();
-  Serial.println("Header exported to /header/myWeights.h");
-}
-
-bool myLoadWeights() {
-  if (!mySDavailable) { Serial.println("No SD card - skipping weight load"); return false; }
-  if (!SD.exists("/header/myWeights.bin")) { Serial.println("No SD weights file found"); return false; }
-  Serial.println("Loading weights from SD...");
-  File f = SD.open("/header/myWeights.bin", FILE_READ);
-  if (!f) return false;
-  f.read((uint8_t*)myConv1_w,  CONV1_WEIGHTS  * 4);
-  f.read((uint8_t*)myConv1_b,  CONV1_FILTERS  * 4);
-  f.read((uint8_t*)myConv2_w,  CONV2_WEIGHTS  * 4);
-  f.read((uint8_t*)myConv2_b,  CONV2_FILTERS  * 4);
-  f.read((uint8_t*)myOutput_w, OUTPUT_WEIGHTS * 4);
-  f.read((uint8_t*)myOutput_b, REG_OUTPUTS    * 4);
-  f.close();
-  Serial.println("Weights loaded successfully");
-  myWeightsTrained = true;
-  return true;
-}
-
-void mySaveWeights() {
-  if (!mySDavailable) { Serial.println("No SD card - cannot save weights"); return; }
-  if (!SD.exists("/header")) SD.mkdir("/header");
-  File f = SD.open("/header/myWeights.bin", FILE_WRITE);
-  if (f) {
-    f.write((uint8_t*)myConv1_w,  CONV1_WEIGHTS  * 4);
-    f.write((uint8_t*)myConv1_b,  CONV1_FILTERS  * 4);
-    f.write((uint8_t*)myConv2_w,  CONV2_WEIGHTS  * 4);
-    f.write((uint8_t*)myConv2_b,  CONV2_FILTERS  * 4);
-    f.write((uint8_t*)myOutput_w, OUTPUT_WEIGHTS * 4);
-    f.write((uint8_t*)myOutput_b, REG_OUTPUTS    * 4);
-    f.close();
-    Serial.println("Weights saved to SD");
-  }
-  myExportHeader();
-}
-
-// ======================================================
-// IMAGE LOADING FROM SD (unchanged from v44)
-// ======================================================
-bool myLoadImageFromFile(const char* path, float* buf) {
-  File f = SD.open(path);
-  if (!f) return false;
-  size_t sz  = f.size();
-  uint8_t* jpg = (uint8_t*)ps_malloc(sz);
-  if (!jpg) { f.close(); return false; }
-  f.read(jpg, sz);
-  f.close();
-  if (!myRgbBuffer) { free(jpg); return false; }
-  bool ok = fmt2rgb888(jpg, sz, PIXFORMAT_JPEG, myRgbBuffer);
-  free(jpg);
-  if (!ok) return false;
-  for (int y = 0; y < INPUT_SIZE; y++) {
-    for (int x = 0; x < INPUT_SIZE; x++) {
-      int sy = (int)((y + 0.5f) * 240.0f / INPUT_SIZE); if (sy > 239) sy = 239;
-      int sx = (int)((x + 0.5f) * 240.0f / INPUT_SIZE); if (sx > 239) sx = 239;
-      int srcIdx = (sy * 240 + sx) * 3;
-      int dstIdx = (y * INPUT_SIZE + x) * 3;
-      buf[dstIdx]   = myRgbBuffer[srcIdx]   / 255.0f;
-      buf[dstIdx+1] = myRgbBuffer[srcIdx+1] / 255.0f;
-      buf[dstIdx+2] = myRgbBuffer[srcIdx+2] / 255.0f;
-    }
-  }
-  return true;
-}
-
-// ======================================================
-// FORWARD DECLARATIONS
-// ======================================================
-void myActionCollect(int classIdx);
-void myActionTrain();
-void myActionInfer();
-void myResetMenuState();
-void myHandleMenuNavigation();
-void myDrawMenu();
-void myForwardPass(float* input);
-void myBackwardOutput(float distTarget, float confTarget);
-void myBackwardConv2();
-void myBackwardPool1();
-void myBackwardConv1();
-void myUpdateWeights(int step);
-
-// ======================================================
-// SETUP
-// ======================================================
-void setup() {
-  Serial.begin(115200);
-  while (!Serial && millis() < 3000);
-  delay(1000);
-
-  Serial.println("\n=== XIAO ESP32-S3 Regression ML System Starting ===");
-  Serial.printf("Free heap:  %d bytes\n", ESP.getFreeHeap());
-  Serial.printf("Free PSRAM: %d bytes\n", ESP.getFreePsram());
-
-  myRgbBuffer = (uint8_t*)ps_malloc(240 * 240 * 3);
-  if (!myRgbBuffer) Serial.println("Failed to allocate RGB buffer!");
-
-  pinMode(A0, INPUT);
-  u8g2.begin();
-
-  pinMode(21, OUTPUT);
-  digitalWrite(21, HIGH);
-  delay(100);
-
-  Serial.println("Checking SD card...");
-  SPI.begin();
-  SPI.setFrequency(400000);
-  mySDavailable = SD.begin(21, SPI, 400000, "/sd", 5, false);
-  if (!mySDavailable) {
-    SD.end();
-    Serial.println("No SD card - continuing without it");
-    u8g2.firstPage();
-    do { u8g2.drawStr(0, 15, "No SD card"); } while (u8g2.nextPage());
-    delay(2000);
-  } else {
-    Serial.println("SD card mounted successfully");
-  }
-
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer   = LEDC_TIMER_0;
-  config.pin_d0  = Y2_GPIO_NUM;  config.pin_d1  = Y3_GPIO_NUM;
-  config.pin_d2  = Y4_GPIO_NUM;  config.pin_d3  = Y5_GPIO_NUM;
-  config.pin_d4  = Y6_GPIO_NUM;  config.pin_d5  = Y7_GPIO_NUM;
-  config.pin_d6  = Y8_GPIO_NUM;  config.pin_d7  = Y9_GPIO_NUM;
-  config.pin_xclk     = XCLK_GPIO_NUM;  config.pin_pclk  = PCLK_GPIO_NUM;
-  config.pin_vsync    = VSYNC_GPIO_NUM; config.pin_href  = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn     = PWDN_GPIO_NUM;  config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size   = FRAMESIZE_240X240;
-  config.jpeg_quality = 12;
-  config.fb_count     = 1;
-  esp_camera_init(&config);
-  Serial.println("Camera initialized");
-
-  sensor_t* s = esp_camera_sensor_get();
-  if (s != NULL) {
-    s->set_vflip(s, 1);
-    s->set_hmirror(s, 1);
-  }
-
-  esp_log_level_set("*",          ESP_LOG_WARN);
-  esp_log_level_set("esp_camera", ESP_LOG_ERROR);
-
-  myAllocateMemory();
-
-#ifdef USE_BAKED_WEIGHTS
-  memcpy(myConv1_w,  myModel_conv1_w,  CONV1_WEIGHTS  * sizeof(float));
-  memcpy(myConv1_b,  myModel_conv1_b,  CONV1_FILTERS  * sizeof(float));
-  memcpy(myConv2_w,  myModel_conv2_w,  CONV2_WEIGHTS  * sizeof(float));
-  memcpy(myConv2_b,  myModel_conv2_b,  CONV2_FILTERS  * sizeof(float));
-  memcpy(myOutput_w, myModel_output_w, OUTPUT_WEIGHTS * sizeof(float));
-  memcpy(myOutput_b, myModel_output_b, REG_OUTPUTS    * sizeof(float));
-  Serial.println("Baked-in weights loaded from myWeights.h");
-  myWeightsTrained = true;
-#endif
-
-  if (myLoadWeights()) Serial.println("SD weights loaded - overriding baked-in weights");
-
-  myLastActivityTime = millis();
-  myResetMenuState();
-  delay(2000);
-
-  Serial.println("System ready - Tap A0 to navigate, 3+ taps to select");
-  Serial.printf("Regression: %d distance classes + blank | unit: %s | max: %.1f\n",
-                NUM_DIST_CLASSES, myDistUnit.c_str(), myDistMax);
-  for (int i = 0; i < NUM_DIST_CLASSES; i++)
-    Serial.printf("  Class %s%s -> target %.3f\n",
-                  myDistLabel[i].c_str(), myDistUnit.c_str(), myDistTarget[i]);
-  myDrawMenu();
-}
-
-void loop() {
-  myHandleMenuNavigation();
-}
-
-
-// ██████████████████████████████████████████████████████████████████████████████
-// ██                                                                          ██
-// ██  PART 1: IMAGE COLLECTION (unchanged from v44 except label source)       ██
-// ██                                                                          ██
-// ██████████████████████████████████████████████████████████████████████████████
-
-void myRenderRgbToOLED(int imageCount) {
-  int myOledWidth  = u8g2.getDisplayWidth();
-  int myOledHeight = u8g2.getDisplayHeight();
-  int myScaleX = 240 / myOledWidth;
-  int myScaleY = 240 / myOledHeight;
-  u8g2.firstPage();
-  do {
-    for (int ox = 0; ox < myOledWidth; ox++) {
-      for (int oy = 0; oy < myOledHeight; oy++) {
-        size_t pi = ((oy * myScaleY) * 240 + (ox * myScaleX)) * 3;
-        uint8_t bright = (myRgbBuffer[pi] + myRgbBuffer[pi+1] + myRgbBuffer[pi+2]) / 3;
-        if (bright > 100) u8g2.drawPixel(ox, oy);
-      }
-    }
-    if (imageCount >= 0) {
-      u8g2.setFont(u8g2_font_ncenB10_tr);
-      u8g2.setColorIndex(0); u8g2.drawBox(0, 0, 20, 15);
-      u8g2.setColorIndex(1); u8g2.setCursor(3, 10); u8g2.print(String(imageCount));
-    } else {
-      u8g2.setFont(u8g2_font_5x7_tf);
-      u8g2.setColorIndex(0); u8g2.drawBox(50, 0, 22, 8);
-      u8g2.setColorIndex(1); u8g2.drawStr(52, 7, "LIVE");
-    }
-  } while (u8g2.nextPage());
-}
-
-void myDisplayImageOnOLED(camera_fb_t* fb, int imageCount) {
-  if (!myRgbBuffer) return;
-  if (!fmt2rgb888(fb->buf, fb->len, fb->format, myRgbBuffer)) return;
-  myRenderRgbToOLED(imageCount);
-}
-
-void myActionCollect(int classIdx) {
-  if (!mySDavailable) {
-    u8g2.firstPage(); do { u8g2.drawStr(0, 15, "No SD card"); } while (u8g2.nextPage());
-    delay(2000); myResetMenuState(); return;
-  }
-  Serial.printf("\n>>> Collection: %s\n", myClassLabels[classIdx].c_str());
-  Serial.println("  TAP = Capture | 3+ taps = Exit | Serial T=capture L=exit");
-  myResetTouchState();
-
-  String path = "/images/" + myClassLabels[classIdx];
-  if (!SD.exists("/images")) SD.mkdir("/images");
-  if (!SD.exists(path))      SD.mkdir(path);
-
-  int count = 0;
-  File root = SD.open(path);
-  if (root) {
-    while (File file = root.openNextFile()) {
-      String fn = String(file.name());
-      if (!file.isDirectory() && (fn.endsWith(".jpg") || fn.endsWith(".JPG"))) count++;
-      file.close();
-    }
-    root.close();
-  }
-
-  unsigned long lastDrain = 0, lastOLED = 0;
-  bool oledDirty = false, shouldCapture = false;
-
-  while (true) {
-    unsigned long now = millis();
-    if (now - lastDrain > 50) {
-      lastDrain = now;
-      if (!shouldCapture) {
-        camera_fb_t* fb = esp_camera_fb_get();
-        if (fb) {
-          if (now - lastOLED > 250 && myRgbBuffer) {
-            if (fmt2rgb888(fb->buf, fb->len, fb->format, myRgbBuffer)) {
-              oledDirty = true; lastOLED = now;
-            }
-          }
-          esp_camera_fb_return(fb);
-        }
-      }
-    }
-    if (oledDirty) { oledDirty = false; myRenderRgbToOLED(-1); }
-
-    if (Serial.available()) {
-      char c = Serial.read();
-      if (c == 'l' || c == 'L') { myResetMenuState(); return; }
-      else if (c == 't' || c == 'T') shouldCapture = true;
-    }
-    int ta = myCheckTouchInput();
-    if (ta == 2) { myResetMenuState(); return; }
-    else if (ta == 1) shouldCapture = true;
-
-    if (shouldCapture) {
-      shouldCapture = false;
-      camera_fb_t* fb = esp_camera_fb_get();
-      if (fb) {
-        String fn = path + "/img_" + String(millis()) + ".jpg";
-        File file = SD.open(fn, FILE_WRITE);
-        if (file) {
-          file.write(fb->buf, fb->len);
-          file.close();
-          count++;
-          Serial.printf("Saved: %s (Total: %d)\n", fn.c_str(), count);
-          myDisplayImageOnOLED(fb, count);
-          delay(300); lastOLED = millis();
-        }
-        esp_camera_fb_return(fb);
-      }
-    }
-    delay(5);
-  }
-}
-
-
-// ██████████████████████████████████████████████████████████████████████████████
-// ██                                                                          ██
-// ██  PART 2: FORWARD PASS, REGRESSION HEAD, BACKWARD PASS, OPTIMIZER        ██
-// ██                                                                          ██
-// ██████████████████████████████████████████████████████████████████████████████
-
-// ======================================================
-// FORWARD PASS
-// Fills: myConv1_output, myPool1_output, myConv2_output,
-//        myRegOutput[0] (raw distance, linear),
-//        myRegOutput[1] (raw confidence, pre-sigmoid),
-//        myDistPred     (= myRegOutput[0], clipped),
-//        myConfPred     (= sigmoid(myRegOutput[1]))
-// ======================================================
-void myForwardPass(float* input) {
-
-  // --- Conv1 (unchanged) ---
-  for (int f = 0; f < CONV1_FILTERS; f++) {
-    int ob = f * CONV1_OUTPUT_SIZE * CONV1_OUTPUT_SIZE;
-    for (int y = 0; y < CONV1_OUTPUT_SIZE; y++) {
-      for (int x = 0; x < CONV1_OUTPUT_SIZE; x++) {
-        float sum = myConv1_b[f];
-        for (int ky = 0; ky < 3; ky++) {
-          for (int kx = 0; kx < 3; kx++) {
-            int inPos = ((y + ky) * INPUT_SIZE + (x + kx)) * 3;
-            int wPos  = f * 27 + ky * 9 + kx * 3;
-            sum += input[inPos]   * myConv1_w[wPos]   +
-                   input[inPos+1] * myConv1_w[wPos+1] +
-                   input[inPos+2] * myConv1_w[wPos+2];
-          }
-        }
-        myConv1_output[ob + y * CONV1_OUTPUT_SIZE + x] = leaky_relu(clip_value(sum));
-      }
-    }
-  }
-
-  // --- Pool1: 2x2 max-pool (unchanged) ---
-  for (int f = 0; f < CONV1_FILTERS; f++) {
-    int ib = f * CONV1_OUTPUT_SIZE * CONV1_OUTPUT_SIZE;
-    int ob = f * POOL1_OUTPUT_SIZE * POOL1_OUTPUT_SIZE;
-    for (int y = 0; y < POOL1_OUTPUT_SIZE; y++) {
-      for (int x = 0; x < POOL1_OUTPUT_SIZE; x++) {
-        int iy = y * 2, ix = x * 2;
-        float mv = myConv1_output[ib + iy * CONV1_OUTPUT_SIZE + ix];
-        mv = max(mv, myConv1_output[ib + iy * CONV1_OUTPUT_SIZE + ix + 1]);
-        mv = max(mv, myConv1_output[ib + (iy+1) * CONV1_OUTPUT_SIZE + ix]);
-        mv = max(mv, myConv1_output[ib + (iy+1) * CONV1_OUTPUT_SIZE + ix + 1]);
-        myPool1_output[ob + y * POOL1_OUTPUT_SIZE + x] = mv;
-      }
-    }
-  }
-
-  // --- Conv2 (unchanged) ---
-  for (int f = 0; f < CONV2_FILTERS; f++) {
-    int ob = f * CONV2_OUTPUT_SIZE * CONV2_OUTPUT_SIZE;
-    for (int y = 0; y < CONV2_OUTPUT_SIZE; y++) {
-      for (int x = 0; x < CONV2_OUTPUT_SIZE; x++) {
-        float sum = myConv2_b[f];
-        for (int c = 0; c < CONV1_FILTERS; c++) {
-          int ib = c * POOL1_OUTPUT_SIZE * POOL1_OUTPUT_SIZE;
-          for (int ky = 0; ky < 3; ky++) {
-            for (int kx = 0; kx < 3; kx++) {
-              sum += myPool1_output[ib + (y+ky)*POOL1_OUTPUT_SIZE + (x+kx)] *
-                     myConv2_w[f * CONV1_FILTERS * 9 + c * 9 + ky * 3 + kx];
-            }
-          }
-        }
-        myConv2_output[ob + y * CONV2_OUTPUT_SIZE + x] = leaky_relu(clip_value(sum));
-      }
-    }
-  }
-
-  // --- Regression output layer (CHANGED from v44) ---
-  // Two neurons over the flattened conv2 output.
-  // Neuron 0: distance  — linear activation (clip to training range)
-  // Neuron 1: confidence — sigmoid activation
-  for (int n = 0; n < REG_OUTPUTS; n++) {
-    // Use Kahan-compensated summation for the large dot product (same as v44 dense layer)
-    double sum = 0.0, comp = 0.0;
-    for (int i = 0; i < FLATTENED_SIZE; i++) {
-      double term = (double)myConv2_output[i] * (double)myOutput_w[n * FLATTENED_SIZE + i];
-      double y2   = term - comp;
-      double t    = sum + y2;
-      comp        = (t - sum) - y2;
-      sum         = t;
-    }
-    myRegOutput[n] = (float)sum + myOutput_b[n];
-  }
-
-  // Apply activations
-  // Distance: linear — clip during training (allows >1.0 extrapolation at inference)
-  myDistPred = clip_value(myRegOutput[0], myDistClipMin, myDistClipMax);
-  // Confidence: sigmoid — naturally bounded [0,1]
-  myConfPred = my_sigmoid(clip_value(myRegOutput[1], -15.0f, 15.0f));
-}
-
-// ======================================================
-// BACKWARD PASS — REGRESSION OUTPUT LAYER (CHANGED from v44)
-//
-// Loss = MSE(distance) + myConfLossWeight * BCE(confidence)
-//
-// MSE gradient  w.r.t. raw distance output (linear activation, deriv=1):
-//   dL/dRaw0 = 2*(distPred - distTarget) / 1.0  (1 sample, not averaged over batch here)
-//
-// BCE gradient w.r.t. raw confidence output (before sigmoid):
-//   dL/dRaw1 = (confPred - confTarget)
-//   This is the clean combined sigmoid+BCE gradient — no separate sigmoid_deriv needed.
-//
-// Both fill myDense_grad (grad w.r.t. myConv2_output flattened).
-// Accumulates into myOutput_w_grad and myOutput_b_grad.
-// ======================================================
-void myBackwardOutput(float distTarget, float confTarget) {
-  // Zero per-image propagation buffer
-  memset(myDense_grad, 0, FLATTENED_SIZE * sizeof(float));
-
-  // Gradient of MSE distance loss w.r.t. raw output[0]
-  // 2*(pred-target) — no activation derivative (linear)
-  float myDistGrad = 2.0f * (myDistPred - distTarget);
-
-  // Gradient of BCE confidence loss w.r.t. raw output[1] (pre-sigmoid)
-  // Combined sigmoid+BCE gradient = confPred - confTarget
-  float myConfGrad = myConfLossWeight * (myConfPred - confTarget);
-
-  float myOutputGrad[REG_OUTPUTS] = { myDistGrad, myConfGrad };
-
-  for (int n = 0; n < REG_OUTPUTS; n++) {
-    float g = myOutputGrad[n];
-    myOutput_b_grad[n] += g;
-    for (int i = 0; i < FLATTENED_SIZE; i++) {
-      myOutput_w_grad[n * FLATTENED_SIZE + i] += g * myConv2_output[i];  // accumulate
-      myDense_grad[i]                         += g * myOutput_w[n * FLATTENED_SIZE + i];
-    }
-  }
-}
-
-// ======================================================
-// BACKWARD PASS — CONV2 (unchanged from v44)
-// ======================================================
-void myBackwardConv2() {
-  for (int i = 0; i < CONV2_OUTPUT_SIZE * CONV2_OUTPUT_SIZE * CONV2_FILTERS; i++)
-    myConv2_grad[i] = myDense_grad[i] * leaky_relu_deriv(myConv2_output[i]);
-
-  memset(myPool1_grad, 0, POOL1_OUTPUT_SIZE * POOL1_OUTPUT_SIZE * CONV1_FILTERS * sizeof(float));
-
-  for (int f = 0; f < CONV2_FILTERS; f++) {
-    int ob = f * CONV2_OUTPUT_SIZE * CONV2_OUTPUT_SIZE;
-    for (int y = 0; y < CONV2_OUTPUT_SIZE; y++) {
-      for (int x = 0; x < CONV2_OUTPUT_SIZE; x++) {
-        float grad = myConv2_grad[ob + y * CONV2_OUTPUT_SIZE + x];
-        myConv2_b_grad[f] += grad;
-        for (int c = 0; c < CONV1_FILTERS; c++) {
-          int ib = c * POOL1_OUTPUT_SIZE * POOL1_OUTPUT_SIZE;
-          for (int ky = 0; ky < 3; ky++) {
-            for (int kx = 0; kx < 3; kx++) {
-              int pi = ib + (y+ky)*POOL1_OUTPUT_SIZE + (x+kx);
-              int wi = f * CONV1_FILTERS * 9 + c * 9 + ky * 3 + kx;
-              myConv2_w_grad[wi]  += grad * myPool1_output[pi];
-              myPool1_grad[pi]    += grad * myConv2_w[wi];
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-// ======================================================
-// BACKWARD PASS — POOL1 (unchanged from v44)
-// ======================================================
-void myBackwardPool1() {
-  memset(myConv1_grad, 0, CONV1_OUTPUT_SIZE * CONV1_OUTPUT_SIZE * CONV1_FILTERS * sizeof(float));
-  for (int f = 0; f < CONV1_FILTERS; f++) {
-    int ib = f * CONV1_OUTPUT_SIZE * CONV1_OUTPUT_SIZE;
-    int ob = f * POOL1_OUTPUT_SIZE * POOL1_OUTPUT_SIZE;
-    for (int y = 0; y < POOL1_OUTPUT_SIZE; y++) {
-      for (int x = 0; x < POOL1_OUTPUT_SIZE; x++) {
-        int iy = y*2, ix = x*2;
-        float poolVal = myPool1_output[ob + y * POOL1_OUTPUT_SIZE + x];
-        float grad    = myPool1_grad[ob + y * POOL1_OUTPUT_SIZE + x];
-        if (myConv1_output[ib + iy*CONV1_OUTPUT_SIZE + ix]       == poolVal) myConv1_grad[ib + iy*CONV1_OUTPUT_SIZE + ix]       += grad;
-        if (myConv1_output[ib + iy*CONV1_OUTPUT_SIZE + ix+1]     == poolVal) myConv1_grad[ib + iy*CONV1_OUTPUT_SIZE + ix+1]     += grad;
-        if (myConv1_output[ib + (iy+1)*CONV1_OUTPUT_SIZE + ix]   == poolVal) myConv1_grad[ib + (iy+1)*CONV1_OUTPUT_SIZE + ix]   += grad;
-        if (myConv1_output[ib + (iy+1)*CONV1_OUTPUT_SIZE + ix+1] == poolVal) myConv1_grad[ib + (iy+1)*CONV1_OUTPUT_SIZE + ix+1] += grad;
-      }
-    }
-  }
-}
-
-// ======================================================
-// BACKWARD PASS — CONV1 (unchanged from v44)
-// ======================================================
-void myBackwardConv1() {
-  for (int i = 0; i < CONV1_OUTPUT_SIZE * CONV1_OUTPUT_SIZE * CONV1_FILTERS; i++)
-    myConv1_grad[i] *= leaky_relu_deriv(myConv1_output[i]);
-
-  for (int f = 0; f < CONV1_FILTERS; f++) {
-    int ob = f * CONV1_OUTPUT_SIZE * CONV1_OUTPUT_SIZE;
-    for (int y = 0; y < CONV1_OUTPUT_SIZE; y++) {
-      for (int x = 0; x < CONV1_OUTPUT_SIZE; x++) {
-        float grad = myConv1_grad[ob + y * CONV1_OUTPUT_SIZE + x];
-        myConv1_b_grad[f] += grad;
-        for (int ky = 0; ky < 3; ky++) {
-          for (int kx = 0; kx < 3; kx++) {
-            int inPos = ((y+ky) * INPUT_SIZE + (x+kx)) * 3;
-            int wPos  = f * 27 + ky * 9 + kx * 3;
-            myConv1_w_grad[wPos]   += grad * myInputBuffer[inPos];
-            myConv1_w_grad[wPos+1] += grad * myInputBuffer[inPos+1];
-            myConv1_w_grad[wPos+2] += grad * myInputBuffer[inPos+2];
-          }
-        }
-      }
-    }
-  }
-}
-
-// ======================================================
-// OPTIMIZER — Adam (unchanged from v44)
-// ======================================================
-void myAdamUpdate(float* w, float* g, float* m, float* v, int size, int step) {
-  float b1 = 0.9f, b2 = 0.999f, eps = 1e-6f;
-  float lr_t = LEARNING_RATE * sqrtf(1.0f - powf(b2, step)) / (1.0f - powf(b1, step));
-  for (int i = 0; i < size; i++) {
-    m[i] = b1 * m[i] + (1.0f - b1) * g[i];
-    v[i] = b2 * v[i] + (1.0f - b2) * g[i] * g[i];
-    w[i] -= lr_t * m[i] / (sqrtf(v[i]) + eps);
-    w[i]  = clip_value(w[i], -10.0f, 10.0f);
-  }
-}
-
-void myUpdateWeights(int step) {
-  myAdamUpdate(myConv1_w,  myConv1_w_grad,  myConv1_w_m,  myConv1_w_v,  CONV1_WEIGHTS,  step);
-  myAdamUpdate(myConv1_b,  myConv1_b_grad,  myConv1_b_m,  myConv1_b_v,  CONV1_FILTERS,  step);
-  myAdamUpdate(myConv2_w,  myConv2_w_grad,  myConv2_w_m,  myConv2_w_v,  CONV2_WEIGHTS,  step);
-  myAdamUpdate(myConv2_b,  myConv2_b_grad,  myConv2_b_m,  myConv2_b_v,  CONV2_FILTERS,  step);
-  myAdamUpdate(myOutput_w, myOutput_w_grad, myOutput_w_m, myOutput_w_v, OUTPUT_WEIGHTS, step);
-  myAdamUpdate(myOutput_b, myOutput_b_grad, myOutput_b_m, myOutput_b_v, REG_OUTPUTS,    step);
-}
-
-// ======================================================
-// TRAINING FUNCTION (CHANGED from v44)
-// ======================================================
-void myActionTrain() {
-  if (!mySDavailable) {
-    u8g2.firstPage(); do { u8g2.drawStr(0, 15, "No SD card"); } while (u8g2.nextPage());
-    delay(2000); myResetMenuState(); return;
-  }
-  Serial.println("\n>>> Training mode (Regression)");
-  Serial.println("  During training: 3+ taps = Save and exit | Serial L=exit");
-  Serial.println("  After completion: TAP = Train again | 3+ taps = Exit");
-  myResetTouchState();
-
-  u8g2.firstPage();
-  do {
-    u8g2.setFont(u8g2_font_6x10_tf);
-    u8g2.drawStr(0, 12, "REGRESSION");
-    u8g2.drawStr(0, 24, "Loading...");
-  } while (u8g2.nextPage());
-
-  if (myLoadWeights()) Serial.println("Continuing from saved weights");
-  else                  Serial.println("Starting fresh training");
-
-  while (true) {
-    myTrainingData.clear();
-    for (int i = 0; i < TOTAL_CLASSES; i++) {
-      File root = SD.open("/images/" + myClassLabels[i]);
-      if (root) {
-        while (File file = root.openNextFile()) {
-          if (!file.isDirectory()) {
-            String fn = String(file.name());
-            if (fn.endsWith(".jpg") || fn.endsWith(".JPG"))
-              myTrainingData.push_back({String(file.path()), i});
-          }
-          file.close();
-        }
-        root.close();
-      }
-    }
-
-    if (myTrainingData.empty()) {
-      u8g2.firstPage(); do { u8g2.drawStr(0, 20, "No Images!"); } while (u8g2.nextPage());
-      delay(2000); myResetMenuState(); return;
-    }
-
-    // Sort for deterministic validation split
-    std::sort(myTrainingData.begin(), myTrainingData.end(),
-              [](const TrainingItem& a, const TrainingItem& b){ return a.path < b.path; });
-
-    std::vector<TrainingItem> myValidationData;
-    if (VALIDATION_IMAGES > 0) {
-      int counts[TOTAL_CLASSES] = {};
-      for (auto& item : myTrainingData) counts[item.label]++;
-      int skip[TOTAL_CLASSES];
-      for (int c = 0; c < TOTAL_CLASSES; c++) skip[c] = min(VALIDATION_IMAGES, counts[c]);
-
-      std::vector<TrainingItem> trainOnly;
-      int seen[TOTAL_CLASSES] = {};
-      for (int i = (int)myTrainingData.size() - 1; i >= 0; i--) {
-        int c = myTrainingData[i].label;
-        if (seen[c] < skip[c]) { myValidationData.push_back(myTrainingData[i]); seen[c]++; }
-        else                    { trainOnly.push_back(myTrainingData[i]); }
-      }
-      myTrainingData = trainOnly;
-      Serial.printf("Val: %d images  Train: %d images\n",
-                    (int)myValidationData.size(), (int)myTrainingData.size());
-    }
-
-    int total           = myTrainingData.size();
-    int batchesPerEpoch = (total + BATCH_SIZE - 1) / BATCH_SIZE;
-    int totalBatches    = TARGET_EPOCHS * batchesPerEpoch;
-    Serial.printf("Training: %d images, %d batches\n", total, totalBatches);
-
-    std::vector<int> indices;
-    for (int i = 0; i < total; i++) indices.push_back(i);
-    float runningLoss = 0.0f;
-    int   lossCount   = 0;
-
-    for (int batch = 0; batch < totalBatches; batch++) {
-
-      // Exit checks
-      if (Serial.available()) {
-        char c = Serial.read();
-        if (c == 'l' || c == 'L' || c == 'x' || c == 'X') {
-          mySaveWeights(); myWeightsTrained = true; myResetMenuState(); return;
-        }
-      }
-      myCheckTouchBackground();
-      if (myPeekTouchAction() == 2) {
-        myCheckTouchInput();
-        mySaveWeights(); myWeightsTrained = true; myResetMenuState(); return;
-      }
-
-      // Shuffle at epoch start
-      if (batch % batchesPerEpoch == 0) {
-        int epoch = batch / batchesPerEpoch + 1;
-        Serial.printf("\n--- Epoch %d/%d ---\n", epoch, TARGET_EPOCHS);
-        for (int i = total - 1; i > 0; i--) {
-          int j = random(i + 1); int tmp = indices[i]; indices[i] = indices[j]; indices[j] = tmp;
-        }
-      }
-
-      int batchStart = (batch % batchesPerEpoch) * BATCH_SIZE;
-      int batchEnd   = min(batchStart + BATCH_SIZE, total);
-      float batchLoss = 0.0f;
-
-      // Zero all weight gradient buffers once per batch
-      memset(myConv1_w_grad,  0, CONV1_WEIGHTS  * sizeof(float));
-      memset(myConv1_b_grad,  0, CONV1_FILTERS  * sizeof(float));
-      memset(myConv2_w_grad,  0, CONV2_WEIGHTS  * sizeof(float));
-      memset(myConv2_b_grad,  0, CONV2_FILTERS  * sizeof(float));
-      memset(myOutput_w_grad, 0, OUTPUT_WEIGHTS * sizeof(float));
-      memset(myOutput_b_grad, 0, REG_OUTPUTS    * sizeof(float));
-
-      for (int i = batchStart; i < batchEnd; i++) {
-        int idx = indices[i];
-        TrainingItem& img = myTrainingData[idx];
-
-        if (!myLoadImageFromFile(img.path.c_str(), myInputBuffer)) continue;
-        myForwardPass(myInputBuffer);
-
-        // Determine targets for this image
-        // label 0 = blank: distTarget irrelevant (conf=0), distTarget=0.5 (neutral)
-        // label 1..NUM_DIST_CLASSES: distTarget from myDistTarget[], conf=1
+// ============================================================
+// CHANGE-1 — Fix blank-class distance target (ISSUE-1)
+// Location: inside myActionTrain(), the training loop, ~line 1155
+// ============================================================
+
+// ---- OLD (v002) ----
         bool myIsBlank     = (img.label == 0);
         float myDTarget    = myIsBlank ? 0.5f : myDistTarget[img.label - 1];
         float myConfTarget = myIsBlank ? 0.0f : 1.0f;
 
-        // Compute combined loss for logging
-        float myDistErr  = myDistPred - myDTarget;
-        float myMSELoss  = myDistErr * myDistErr;
-        float myBCELoss  = -(myConfTarget * logf(myConfPred + 1e-7f)
-                           + (1.0f - myConfTarget) * logf(1.0f - myConfPred + 1e-7f));
-        float myTotalLoss = myMSELoss + myConfLossWeight * myBCELoss;
-        batchLoss += myTotalLoss;
+// ---- NEW (v003) ----
+        bool myIsBlank     = (img.label == 0);
+        // CHANGE-1: blank distTarget changed from 0.5f to 0.0f.
+        // When confidence=0 the distance head gradient is suppressed by
+        // myConfLossWeight but not zeroed.  Targeting 0.0 keeps blank
+        // images from anchoring the distance head at the midpoint,
+        // giving the top label room to push above 1.0.
+        float myDTarget    = myIsBlank ? 0.0f : myDistTarget[img.label - 1];
+        float myConfTarget = myIsBlank ? 0.0f : 1.0f;
 
-        myBackwardOutput(myDTarget, myConfTarget);
-        myBackwardConv2();
-        myBackwardPool1();
-        myBackwardConv1();
+// Apply the same fix in the VALIDATION PASS (~line 1220):
 
-        // Background touch/serial every 3 images
-        if (i % 3 == 0) {
-          myCheckTouchBackground();
-          if (myPeekTouchAction() == 2) {
-            myCheckTouchInput();
-            mySaveWeights(); myWeightsTrained = true; myResetMenuState(); return;
-          }
-          if (Serial.available()) {
-            char c = Serial.read();
-            if (c == 'l' || c == 'L' || c == 'x' || c == 'X') {
-              mySaveWeights(); myWeightsTrained = true; myResetMenuState(); return;
-            }
-          }
-        }
-      }
-
-      myUpdateWeights(batch + 1);
-
-      float avgLoss = batchLoss / (batchEnd - batchStart);
-      runningLoss += avgLoss;
-      lossCount++;
-
-      if ((batch + 1) % 5 == 0) {
-        float dLoss = runningLoss / lossCount;
-        u8g2.firstPage();
-        do {
-          u8g2.setFont(u8g2_font_5x7_tf);
-          u8g2.setCursor(0, 12); u8g2.print("Regression...");
-          u8g2.setCursor(0, 24);
-          u8g2.print("B:"); u8g2.print(batch+1); u8g2.print("/"); u8g2.print(totalBatches);
-          u8g2.setCursor(0, 36);
-          u8g2.print("L:"); u8g2.print(dLoss, 3);
-        } while (u8g2.nextPage());
-        runningLoss = 0.0f; lossCount = 0;
-      }
-      if ((batch + 1) % 10 == 0)
-        Serial.printf("Batch %d/%d - Loss: %.4f\n", batch+1, totalBatches, avgLoss);
-    }
-
-    Serial.println("\n--- Training Complete ---");
-
-    // Validation pass — report MAE on distance and confidence accuracy
-    if (!myValidationData.empty()) {
-      float totalDistErr = 0.0f;
-      int   confCorrect  = 0, valCount = 0;
-      for (auto& vitem : myValidationData) {
-        if (!myLoadImageFromFile(vitem.path.c_str(), myInputBuffer)) continue;
-        myForwardPass(myInputBuffer);
+// ---- OLD (v002) ----
         bool vIsBlank    = (vitem.label == 0);
         float vDTarget   = vIsBlank ? 0.5f : myDistTarget[vitem.label - 1];
-        float vConfTarget = vIsBlank ? 0.0f : 1.0f;
-        totalDistErr += fabsf(myDistPred - vDTarget);
-        if ((myConfPred >= myConfThreshold) == (vConfTarget >= 0.5f)) confCorrect++;
-        valCount++;
+
+// ---- NEW (v003) ----
+        bool vIsBlank    = (vitem.label == 0);
+        float vDTarget   = vIsBlank ? 0.0f : myDistTarget[vitem.label - 1]; // CHANGE-1
+
+
+// ============================================================
+// CHANGE-2 — Warm-start output bias higher (ISSUE-2)
+// Location: myAllocateMemory(), ~line 457
+// ============================================================
+
+// ---- OLD (v002) ----
+  // Bias init: distance head starts at 0.5 (midpoint), confidence at 0
+  myOutput_b[0] = 0.5f;   // distance neuron bias — warm-start near midpoint
+  myOutput_b[1] = 0.0f;   // confidence neuron bias
+
+// ---- NEW (v003) ----
+  // CHANGE-2: distance bias warm-started at 0.9f instead of 0.5f.
+  // The training targets span 0.2–1.0; starting near the top shortens
+  // the optimiser's journey and leaves the bias free to exceed 1.0
+  // once gradient pressure from the top label pushes it there.
+  myOutput_b[0] = 0.9f;   // distance neuron bias — warm-start near top target
+  myOutput_b[1] = 0.0f;   // confidence neuron bias
+
+
+// ============================================================
+// CHANGE-3 — Post-training calibration fit + calibrated inference
+// (ISSUE-3)
+//
+// Three parts:
+//   3a. New globals (add near other globals, ~line 288)
+//   3b. New function myFitCalibration() (add before myActionInfer)
+//   3c. Call myFitCalibration() at end of myActionTrain()
+//   3d. Use myCalibratedDist in myActionInfer() instead of raw * myDistMax
+// ============================================================
+
+// ---- 3a: NEW GLOBALS — add after the existing myDistPred / myConfPred lines ----
+// (~line 289, after:  float  myConfPred  = 0.0f; )
+
+// CHANGE-3a: calibration state — filled once after training by myFitCalibration()
+float myCalibSlope  = 10.0f;   // default = myDistMax (identity mapping)
+float myCalibOffset =  0.0f;
+bool  myCalibReady  = false;
+
+
+// ---- 3b: NEW FUNCTION — insert just before void myActionInfer() ----
+
+// ======================================================
+// CALIBRATION FIT (CHANGE-3b)
+//
+// Call once after training with the mean raw myDistPred values the
+// network actually produces for each distance class.
+// Fits a least-squares line through (rawPred[], realDist_cm[]) pairs
+// and stores slope + offset for use at inference.
+//
+// With 3 labels the line is over-determined (3 points, 2 params) —
+// that is fine; least-squares gives the best straight-line fit.
+// The line extrapolates naturally for rawPred > 1.0.
+// ======================================================
+void myFitCalibration(float myRawPreds[], float myRealDists[], int myN) {
+  if (myN < 2) {
+    // Fallback: single point or no data — use identity * myDistMax
+    myCalibSlope  = myDistMax;
+    myCalibOffset = 0.0f;
+    myCalibReady  = true;
+    Serial.println("Calibration: fallback identity (too few points)");
+    return;
+  }
+  float mySumX = 0, mySumY = 0, mySumXX = 0, mySumXY = 0;
+  for (int i = 0; i < myN; i++) {
+    mySumX  += myRawPreds[i];
+    mySumY  += myRealDists[i];
+    mySumXX += myRawPreds[i] * myRawPreds[i];
+    mySumXY += myRawPreds[i] * myRealDists[i];
+  }
+  float myDenom = myN * mySumXX - mySumX * mySumX;
+  if (fabsf(myDenom) < 1e-6f) {
+    // Degenerate (all predictions identical) — use mean ratio
+    myCalibSlope  = (mySumX > 1e-4f) ? mySumY / mySumX : myDistMax;
+    myCalibOffset = 0.0f;
+  } else {
+    myCalibSlope  = (myN * mySumXY - mySumX * mySumY) / myDenom;
+    myCalibOffset = (mySumY - myCalibSlope * mySumX)   / myN;
+  }
+  myCalibReady = true;
+  Serial.printf("Calibration fit: dist = %.3f * rawPred + %.3f\n",
+                myCalibSlope, myCalibOffset);
+  Serial.println("  (extrapolates linearly beyond training max)");
+}
+
+
+// ---- 3c: CALL myFitCalibration() at the end of myActionTrain() ----
+// Insert AFTER the existing validation block (after the Serial.printf
+// "Validation: MAE=..." line) and BEFORE mySaveWeights().
+
+// ---- OLD (v002) — the end of myActionTrain() looks like: ----
+    mySaveWeights();
+    myWeightsTrained = true;
+
+// ---- NEW (v003) — replace those two lines with: ----
+
+    // CHANGE-3c: calibration pass — run forward on all training images,
+    // accumulate mean raw myDistPred per distance class, then fit line.
+    {
+      float myCalibSumPred[NUM_DIST_CLASSES] = {};
+      int   myCalibCount[NUM_DIST_CLASSES]   = {};
+
+      for (auto& citem : myTrainingData) {
+        if (citem.label == 0) continue;                         // skip blank
+        if (!myLoadImageFromFile(citem.path.c_str(), myInputBuffer)) continue;
+        myForwardPass(myInputBuffer);
+        int ci = citem.label - 1;                              // 0-based class index
+        myCalibSumPred[ci] += myDistPred;
+        myCalibCount[ci]++;
       }
-      if (valCount > 0) {
-        Serial.printf("Validation: MAE=%.4f  ConfAcc=%.1f%% (%d/%d)\n",
-                      totalDistErr / valCount,
-                      100.0f * confCorrect / valCount,
-                      confCorrect, valCount);
+
+      // Build anchor arrays: mean rawPred → real distance (cm)
+      float myAnchorRaw[NUM_DIST_CLASSES];
+      float myAnchorDist[NUM_DIST_CLASSES];
+      int   myAnchorN = 0;
+      for (int ci = 0; ci < NUM_DIST_CLASSES; ci++) {
+        if (myCalibCount[ci] > 0) {
+          myAnchorRaw[myAnchorN]  = myCalibSumPred[ci] / myCalibCount[ci];
+          myAnchorDist[myAnchorN] = myDistTarget[ci] * myDistMax;  // e.g. 0.2*10=2cm
+          Serial.printf("  Calib anchor: class %s%s  meanRaw=%.4f  real=%.1f%s\n",
+                        myDistLabel[ci].c_str(), myDistUnit.c_str(),
+                        myAnchorRaw[myAnchorN], myAnchorDist[myAnchorN],
+                        myDistUnit.c_str());
+          myAnchorN++;
+        }
       }
+      myFitCalibration(myAnchorRaw, myAnchorDist, myAnchorN);
     }
 
     mySaveWeights();
     myWeightsTrained = true;
 
-    u8g2.firstPage();
-    do {
-      u8g2.drawStr(0, 12, "DONE!");
-      u8g2.drawStr(0, 24, "Tap:Again");
-      u8g2.drawStr(0, 36, "3+Taps:Exit");
-    } while (u8g2.nextPage());
 
-    myResetTouchState();
-    while (true) {
-      if (Serial.available()) {
-        char c = Serial.read();
-        if (c == 'l' || c == 'L' || c == 'x' || c == 'X') { myResetMenuState(); return; }
-        else if (c == 't' || c == 'T') break;
-      }
-      int ta = myCheckTouchInput();
-      if (ta == 2) { myResetMenuState(); return; }
-      else if (ta == 1) break;
-      delay(10);
-    }
-  }
-}
+// ---- 3d: USE myCalibratedDist IN myActionInfer() ----
+// There are TWO places in myActionInfer() where myRealDist is computed.
+// Replace BOTH occurrences.
 
-
-// ██████████████████████████████████████████████████████████████████████████████
-// ██                                                                          ██
-// ██  PART 3: INFERENCE (CHANGED from v44)                                    ██
-// ██                                                                          ██
-// ██  Reports de-normalized distance and confidence percentage.               ██
-// ██  Extrapolated values (>myDistMax) are shown as-is — this is expected     ██
-// ██  and pedagogically useful: regression can go beyond training range.      ██
-// ██                                                                          ██
-// ██████████████████████████████████████████████████████████████████████████████
-
-void myActionInfer() {
-  if (!myWeightsTrained) {
-    u8g2.firstPage();
-    do {
-      u8g2.setFont(u8g2_font_6x10_tf);
-      u8g2.drawStr(0, 12, "No weights!");
-      u8g2.drawStr(0, 24, "Train first");
-    } while (u8g2.nextPage());
-    delay(3000); myResetMenuState(); return;
-  }
-
-  Serial.println("\n>>> Inference mode (Regression)");
-  Serial.printf("  Unit: %s  Max: %.1f  Conf threshold: %.2f\n",
-                myDistUnit.c_str(), myDistMax, myConfThreshold);
-  Serial.println("  T or L = exit to menu");
-  myResetTouchState();
-
-  if (!myInputBuffer) {
-    u8g2.firstPage(); do { u8g2.drawStr(0, 15, "NOT READY!"); } while (u8g2.nextPage());
-    delay(2000); myResetMenuState(); return;
-  }
-
-  // Pre-compute resize lookup tables
-  static int  sy_lookup[INPUT_SIZE];
-  static int  sx_lookup[INPUT_SIZE];
-  static bool lookup_initialized = false;
-  if (!lookup_initialized) {
-    for (int i = 0; i < INPUT_SIZE; i++) {
-      sy_lookup[i] = min((int)((i + 0.5f) * 240.0f / INPUT_SIZE), 239);
-      sx_lookup[i] = min((int)((i + 0.5f) * 240.0f / INPUT_SIZE), 239);
-    }
-    lookup_initialized = true;
-  }
-
-  int oW = u8g2.getDisplayWidth();    // 72
-  int oH = u8g2.getDisplayHeight();   // 40
-  int scX = 240 / oW;
-  int scY = 240 / oH;
-
-  unsigned long frameTimes[10];
-  int frameIndex = 0;
-
-  while (true) {
-    unsigned long frameStart = millis();
-
-    if (Serial.available()) {
-      char c = Serial.read();
-      if (c == 't' || c == 'T' || c == 'l' || c == 'L') { myResetMenuState(); return; }
-    }
-
-    camera_fb_t* fb = esp_camera_fb_get();
-    if (!fb) { delay(10); continue; }
-    if (!myRgbBuffer) { esp_camera_fb_return(fb); delay(10); continue; }
-
-    if (fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, myRgbBuffer)) {
-      // Resize to input buffer
-      for (int y = 0; y < INPUT_SIZE; y++) {
-        int sy = sy_lookup[y];
-        for (int x = 0; x < INPUT_SIZE; x++) {
-          int srcIdx = (sy * 240 + sx_lookup[x]) * 3;
-          int dstIdx = (y * INPUT_SIZE + x) * 3;
-          myInputBuffer[dstIdx]   = myRgbBuffer[srcIdx]   * 0.003921569f;
-          myInputBuffer[dstIdx+1] = myRgbBuffer[srcIdx+1] * 0.003921569f;
-          myInputBuffer[dstIdx+2] = myRgbBuffer[srcIdx+2] * 0.003921569f;
-        }
-      }
-
-      myForwardPass(myInputBuffer);
-
+// ---- OLD (v002) — first occurrence (~line 1342) ----
       // De-normalize distance to real-world units
       // NOTE: myDistPred can exceed 1.0 — this is intentional (extrapolation)
       float myRealDist = myDistPred * myDistMax;
       bool  myObjectDetected = (myConfPred >= myConfThreshold);
 
-      // Update OLED every 10 frames
-      if (frameIndex == 9) {
-        u8g2.firstPage();
-        do {
-          // Draw camera image
-          for (int ox = 0; ox < oW; ox++) {
-            for (int oy = 0; oy < oH; oy++) {
-              int pi = ((oy * scY) * 240 + (ox * scX)) * 3;
-              uint8_t bright = (myRgbBuffer[pi] + myRgbBuffer[pi+1] + myRgbBuffer[pi+2]) / 3;
-              if (bright > 100) u8g2.drawPixel(ox, oy);
-            }
-          }
-          // Label bar at bottom
-          u8g2.setFont(u8g2_font_5x7_tf);
-          u8g2.setColorIndex(0);
-          u8g2.drawBox(0, oH - 9, oW, 9);
-          u8g2.setColorIndex(1);
-          char buf[24];
-          if (myObjectDetected)
-            snprintf(buf, sizeof(buf), "%.1f%s %d%%",
-                     myRealDist, myDistUnit.c_str(), (int)(myConfPred * 100));
-          else
-            snprintf(buf, sizeof(buf), "NoObj %d%%", (int)(myConfPred * 100));
-          u8g2.drawStr(1, oH - 1, buf);
-        } while (u8g2.nextPage());
-      }
-    }
+// ---- NEW (v003) ----
+      // CHANGE-3d: use calibration line instead of raw * myDistMax.
+      // myCalibSlope/Offset were fitted to the actual network outputs after
+      // training, so the line passes through the real anchor distances and
+      // extrapolates naturally for rawPred > 1.0.
+      // Fallback to identity if calibration was never run (e.g. baked weights).
+      float myRealDist = myCalibReady
+                         ? (myCalibSlope * myDistPred + myCalibOffset)
+                         : (myDistPred * myDistMax);
+      bool  myObjectDetected = (myConfPred >= myConfThreshold);
 
-    esp_camera_fb_return(fb);
-
-    frameTimes[frameIndex] = millis() - frameStart;
-    float fps = 1000.0f / max((unsigned long)1, frameTimes[frameIndex]);
-
-    // Serial output every frame
+// ---- OLD (v002) — second occurrence (~line 1379) ----
     float myRealDist = myDistPred * myDistMax;
     bool  myObjectDetected = (myConfPred >= myConfThreshold);
 
-    Serial.printf("F%d: %.0fFPS | ", frameIndex + 1, fps);
-    if (myObjectDetected)
-      Serial.printf("DIST=%.2f%s (norm=%.3f) CONF=%.0f%%",
-                    myRealDist, myDistUnit.c_str(), myDistPred, myConfPred * 100.0f);
-    else
-      Serial.printf("NoObject CONF=%.0f%% (dist_raw=%.3f)",
-                    myConfPred * 100.0f, myDistPred);
-
-    // Flag extrapolation
-    if (myObjectDetected && myDistPred > 1.0f)
-      Serial.printf(" [EXTRAPOLATED >%.1f%s]", myDistMax, myDistUnit.c_str());
-
-    Serial.println();
-
-    frameIndex++;
-    if (frameIndex >= 10) {
-      int touchVal = myReadTouch();
-      if (touchVal > myThresholdPress) {
-        delay(200); myResetMenuState(); return;
-      }
-      frameIndex = 0;
-    }
-  }
-}
+// ---- NEW (v003) ----
+    float myRealDist = myCalibReady                            // CHANGE-3d
+                       ? (myCalibSlope * myDistPred + myCalibOffset)
+                       : (myDistPred * myDistMax);
+    bool  myObjectDetected = (myConfPred >= myConfThreshold);
 
 
-// ██████████████████████████████████████████████████████████████████████████████
-// ██                                                                          ██
-// ██  PART 4: MENU SYSTEM (CHANGED: label source updated for regression)      ██
-// ██                                                                          ██
-// ██████████████████████████████████████████████████████████████████████████████
+// ======================================================
+// OPTIONAL — Save/load calibration to SD so baked-weight
+// builds also get extrapolation.  Add to mySaveWeights()
+// and myLoadWeights() if desired.
+// ======================================================
 
-void myResetMenuState() {
-  myIsSelected = false;
-  myResetTouchState();
-  myLastActivityTime = millis();
-  myDrawMenu();
-}
+// In mySaveWeights(), after the existing f.write() calls:
+  // OPTIONAL-3e: persist calibration alongside weights
+  f.write((uint8_t*)&myCalibSlope,  sizeof(float));
+  f.write((uint8_t*)&myCalibOffset, sizeof(float));
 
-// Returns human-readable label for menu item index (1-based)
-String myGetMenuLabel(int idx) {
-  if (idx <= TOTAL_CLASSES)      return myClassLabels[idx - 1];   // collect folder label
-  if (idx == TOTAL_CLASSES + 1)  return "Train";
-  return "Infer";
-}
-
-void myDrawMenu() {
-  Serial.println("\n=== MENU ===");
-  for (int i = 1; i <= myTotalItems; i++) {
-    Serial.print(i == myMenuIndex ? " > " : "   ");
-    Serial.printf("%d. %s\n", i, myGetMenuLabel(i).c_str());
-  }
-  Serial.println("Commands: t=next  l=select  1-9=direct");
-
-  u8g2.firstPage();
-  do {
-    u8g2.setFont(u8g2_font_6x10_tf);
-    u8g2.drawStr(0, 8, "TAP:Next HOLD:Ok");
-    int myStartItem = max(1, myMenuIndex - 1);
-    for (int i = 0; i < 3; i++) {
-      int cur = myStartItem + i;
-      if (cur > myTotalItems) break;
-      int y = 18 + i * 9;
-      String label = (cur == myMenuIndex ? "> " : "  ") + myGetMenuLabel(cur);
-      u8g2.drawStr(0, y, label.c_str());
-    }
-  } while (u8g2.nextPage());
-}
-
-void myExecuteMenuItem(int idx) {
-  if (idx <= TOTAL_CLASSES)      myActionCollect(idx - 1);
-  else if (idx == TOTAL_CLASSES + 1) myActionTrain();
-  else                           myActionInfer();
-}
-
-void myHandleMenuNavigation() {
-  unsigned long now = millis();
-
-  if (!myIsSelected && Serial.available()) {
-    char c = Serial.read();
-    if (c >= '1' && c <= '9') {
-      int newIndex = c - '0';
-      if (newIndex <= myTotalItems) {
-        myMenuIndex = newIndex; myIsSelected = true;
-        myLastActivityTime = now; myExecuteMenuItem(myMenuIndex);
-      }
-    } else if (c == 't' || c == 'T') {
-      if (now - myLastTapTime > myTapCooldown) {
-        myMenuIndex = (myMenuIndex % myTotalItems) + 1;
-        myDrawMenu(); myLastTapTime = now; myLastActivityTime = now;
-      }
-    } else if (c == 'l' || c == 'L') {
-      myIsSelected = true; myLastActivityTime = now; myExecuteMenuItem(myMenuIndex);
-    }
+// In myLoadWeights(), after the existing f.read() calls:
+  // OPTIONAL-3e: restore calibration
+  if (f.read((uint8_t*)&myCalibSlope,  sizeof(float)) == sizeof(float) &&
+      f.read((uint8_t*)&myCalibOffset, sizeof(float)) == sizeof(float)) {
+    myCalibReady = true;
+    Serial.printf("Calibration loaded: slope=%.3f offset=%.3f\n",
+                  myCalibSlope, myCalibOffset);
   }
 
-  if (!myIsSelected) {
-    int ta = myCheckTouchInput();
-    if (ta == 1) {
-      if (now - myLastTapTime > myTapCooldown) {
-        myMenuIndex = (myMenuIndex % myTotalItems) + 1;
-        myDrawMenu(); myLastTapTime = now; myLastActivityTime = now;
-      }
-    } else if (ta == 2) {
-      myIsSelected = true; myLastActivityTime = now; myExecuteMenuItem(myMenuIndex);
-    }
-  }
-}
+// NOTE: if you add OPTIONAL-3e you must retrain once to write the new
+// binary format.  Old myWeights.bin files will load weights correctly
+// but the trailing calib read will fail silently (f.read returns 0),
+// myCalibReady stays false, and inference falls back to raw * myDistMax.
+// ======================================================
