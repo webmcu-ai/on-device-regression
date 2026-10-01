@@ -1,6 +1,7 @@
 // ======================================================
 // XIAO ML KIT (OR XIAO ESP32S3 SENSE)
-// FULL VISION ML — REGRESSION HEAD — v002
+// FULL VISION ML — REGRESSION HEAD — paired firmware v002
+// (pairs with index-v002.html, the SD-card web trainer)
 //
 // Predicts a continuous distance value from camera images.
 // Two output neurons:
@@ -30,6 +31,26 @@
 // board_build.arduino.memory_type = qio_opi
 // board_build.flash_mode = qio
 // board_upload.flash_size = 8MB
+//
+// ======================================================
+// PAIRED-FIRMWARE v002 — WHAT CHANGED FOR THE WEB PAGE (every edit is marked "// web-v002:")
+//
+//  1. Layout is compile-time and fully derived: INPUT_SIZE, CONV1_FILTERS, CONV2_FILTERS
+//     (and the class list) are the only layout numbers. Layout and class count stay
+//     COMPILE-TIME on purpose (no runtime allocation). The exact weight file size is
+//     MY_WEIGHT_BYTES (+8 bytes for the two calibration floats).
+//  2. /header/myWeights.bin is refused if its size does not match this sketch.
+//  3. /header/config.json (written by index-v002.html) supplies the class folder names
+//     ("classes", only when its length equals TOTAL_CLASSES). input_size, conv1_filters,
+//     conv2_filters, dist_targets and dist_max are only CHECKED and a WARNING is printed
+//     on mismatch. They are never applied at runtime (they are compile-time).
+//  4. Camera parity #defines (CAM_...) so device images look like page images.
+//     !! IMAGE COMPATIBILITY: v001 used hmirror ON, vflip ON and no brightness/AE change.
+//     Orientation is UNCHANGED, but brightness +1 / AE level +1 make new images a little
+//     brighter than images already on the SD card. For best results recapture old images.
+//     These CAM_ values need bench tuning against the page's webcam images.
+//  5. Web Serial debug frames ("@F" lines), only while the page is connected and asks
+//     for them with 'D' (heartbeat every 5 s, 'd' on disconnect, auto-off after 15 s).
 //
 // ======================================================
 // v002 CHANGES FROM v001 — EXTRAPOLATION FIX:
@@ -86,6 +107,8 @@
 
 
 // Uncomment AFTER copying myWeights.h from SD to your sketch folder:
+// (myWeights.h holds the network weights only, NOT the calibration line, so baked
+//  weights report distance as raw * myDistMax until a weights .bin with calibration loads)
 //#define USE_BAKED_WEIGHTS
 
 #ifdef USE_BAKED_WEIGHTS
@@ -101,6 +124,7 @@
 #include <algorithm>
 #include <U8g2lib.h>
 #include <Wire.h>
+#include "mbedtls/base64.h"   // web-v002: base64 for debug frames
 
 U8G2_SSD1306_72X40_ER_1_HW_I2C u8g2(U8G2_R2, U8X8_PIN_NONE);
 
@@ -151,6 +175,7 @@ const float myDistClipMax =  2.0f;
 
 // SD folder names — index 0 is always blank, then one per distance class
 // These must match the actual folder names you create on the SD card.
+// web-v002: replaced at boot by "classes" in /header/config.json when its length == TOTAL_CLASSES
 String myClassLabels[TOTAL_CLASSES] = {"0Blank", "2", "5", "10"};
 
 // Loss weighting: confidence BCE term is scaled by this factor.
@@ -164,6 +189,15 @@ float LEARNING_RATE   = 0.0003f;
 int   BATCH_SIZE      = 6;
 int   TARGET_EPOCHS   = 60;
 int   VALIDATION_IMAGES = 3;   // last N images per class held out for validation (0 = disabled)
+
+// ======================================================
+// web-v002: CAMERA / PAGE PARITY (bench-tune these so device images look like page images)
+// ======================================================
+#define CAM_HMIRROR       1   // sensor horizontal mirror (page checkbox "Mirror" defaults to this)
+#define CAM_VFLIP         1   // sensor vertical flip: corrects the board's mounting, page does not flip
+#define CAM_BRIGHTNESS    1   // -2..2  (v001: not set)
+#define CAM_AE_LEVEL      1   // -2..2  (v001: not set)
+#define CAM_WARMUP_FRAMES 3   // frames discarded after init so auto-exposure can settle
 
 // ======================================================
 // TOUCH THRESHOLDS
@@ -227,7 +261,10 @@ const int myTotalItems = TOTAL_CLASSES + 2;
 #define INPUT_SIZE 64
 
 // ======================================================
-// CNN ARCHITECTURE CONSTANTS (unchanged from v44)
+// CNN ARCHITECTURE CONSTANTS
+// web-v002: LAYOUT IS COMPILE-TIME. The only layout numbers are INPUT_SIZE,
+// CONV1_FILTERS and CONV2_FILTERS. Everything else is derived from them.
+// The 3x3 kernels are hard-coded in the loops and are NOT configurable.
 // ======================================================
 #define CONV1_KERNEL_SIZE 3
 #define CONV1_FILTERS     4
@@ -237,10 +274,17 @@ const int myTotalItems = TOTAL_CLASSES + 2;
 #define CONV2_FILTERS     8
 #define CONV2_WEIGHTS     (CONV2_KERNEL_SIZE * CONV2_KERNEL_SIZE * CONV1_FILTERS * CONV2_FILTERS)
 
-#define CONV1_OUTPUT_SIZE (INPUT_SIZE - 2)
+#define CONV1_OUTPUT_SIZE (INPUT_SIZE - CONV1_KERNEL_SIZE + 1)     // web-v002: derived from kernel (was INPUT_SIZE - 2)
 #define POOL1_OUTPUT_SIZE (CONV1_OUTPUT_SIZE / 2)
-#define CONV2_OUTPUT_SIZE (POOL1_OUTPUT_SIZE - 2)
+#define CONV2_OUTPUT_SIZE (POOL1_OUTPUT_SIZE - CONV2_KERNEL_SIZE + 1) // web-v002: derived from kernel (was - 2)
 #define FLATTENED_SIZE    (CONV2_OUTPUT_SIZE * CONV2_OUTPUT_SIZE * CONV2_FILTERS)
+
+// web-v002: constraints checked at compile time
+static_assert(CONV1_KERNEL_SIZE == 3 && CONV2_KERNEL_SIZE == 3, "the loops hard-code 3x3 kernels");
+static_assert(INPUT_SIZE % 2 == 0, "INPUT_SIZE must be even (2x2 max-pool after conv1)");
+static_assert(INPUT_SIZE <= 240, "INPUT_SIZE cannot exceed the 240x240 camera frame");
+static_assert(CONV2_OUTPUT_SIZE >= 1, "INPUT_SIZE too small: conv2 output would be empty");
+static_assert(CONV1_FILTERS >= 1 && CONV2_FILTERS >= 1, "filter counts must be at least 1");
 
 // ======================================================
 // REGRESSION OUTPUT CONSTANTS
@@ -249,11 +293,17 @@ const int myTotalItems = TOTAL_CLASSES + 2;
 #define REG_OUTPUTS     2                        // always 2: distance + confidence
 #define OUTPUT_WEIGHTS  (FLATTENED_SIZE * REG_OUTPUTS)
 
+// web-v002: exact weight file size. The class count is NOT part of it (output is always 2 neurons).
+// A saved file is this many bytes plus 8 (calibration slope + offset, two float32).
+#define MY_WEIGHT_FLOATS (CONV1_WEIGHTS + CONV1_FILTERS + CONV2_WEIGHTS + CONV2_FILTERS + OUTPUT_WEIGHTS + REG_OUTPUTS)
+#define MY_WEIGHT_BYTES  (MY_WEIGHT_FLOATS * 4)
+
 // ======================================================
 // GLOBAL VARIABLE DEFINITIONS
 // ======================================================
 uint8_t* myRgbBuffer = nullptr;
 bool     mySDavailable = false;
+bool     myCameraOK    = false;   // web-v002: set after esp_camera_init succeeds
 
 // ML weight buffers (PSRAM)
 float* myInputBuffer  = nullptr;
@@ -503,12 +553,30 @@ void myExportHeader() {
   Serial.println("Header exported to /header/myWeights.h");
 }
 
+// web-v002: print the layout this sketch was compiled with (used on startup and on a size mismatch)
+void myPrintLayout() {
+  Serial.printf("Sketch layout: input %dx%d, conv1 %d filters, conv2 %d filters, flatten %d, "
+                "%d weights = %u bytes (+8 calibration = %u)\n",
+                INPUT_SIZE, INPUT_SIZE, CONV1_FILTERS, CONV2_FILTERS, FLATTENED_SIZE,
+                MY_WEIGHT_FLOATS, (unsigned)MY_WEIGHT_BYTES, (unsigned)(MY_WEIGHT_BYTES + 8));
+}
+
 bool myLoadWeights() {
   if (!mySDavailable) { Serial.println("No SD card - skipping weight load"); return false; }
   if (!SD.exists("/header/myWeights.bin")) { Serial.println("No SD weights file found"); return false; }
   Serial.println("Loading weights from SD...");
   File f = SD.open("/header/myWeights.bin", FILE_READ);
   if (!f) return false;
+  // web-v002: refuse a weights file that does not fit this compiled layout
+  size_t myFileSize = f.size();
+  if (myFileSize != MY_WEIGHT_BYTES && myFileSize != MY_WEIGHT_BYTES + 8) {
+    Serial.printf("WEIGHTS REFUSED: /header/myWeights.bin is %u bytes, this sketch needs %u (or %u with calibration)\n",
+                  (unsigned)myFileSize, (unsigned)MY_WEIGHT_BYTES, (unsigned)(MY_WEIGHT_BYTES + 8));
+    myPrintLayout();
+    f.close();
+    return false;   // caller keeps the random or baked weights
+  }
+  myCalibReady = false;   // web-v002: never keep an old calibration for a newly loaded file
   f.read((uint8_t*)myConv1_w,  CONV1_WEIGHTS  * 4);
   f.read((uint8_t*)myConv1_b,  CONV1_FILTERS  * 4);
   f.read((uint8_t*)myConv2_w,  CONV2_WEIGHTS  * 4);
@@ -521,6 +589,8 @@ bool myLoadWeights() {
     myCalibReady = true;
     Serial.printf("Calibration loaded: slope=%.3f offset=%.3f\n",
                   myCalibSlope, myCalibOffset);
+  } else {
+    Serial.println("WARNING: no calibration in weights file - distance = raw * myDistMax until you Train or load a file with calibration");   // web-v002
   }
 
   f.close();
@@ -594,6 +664,188 @@ void myBackwardPool1();
 void myBackwardConv1();
 void myUpdateWeights(int step);
 
+// ==CFG PARSE START==
+// web-v002: tiny hand-written reader for /header/config.json (no JSON library).
+// Uses only "classes" (applied) and input_size / conv1_filters / conv2_filters /
+// dist_targets / dist_max (checked, WARNING only: they are compile-time).
+static int myCfgKey(const String& s, const char* key) {      // index just after the ':' of "key", or -1
+  String k = String("\"") + key + "\"";
+  int i = s.indexOf(k);
+  if (i < 0) return -1;
+  i = s.indexOf(':', i + k.length());
+  return (i < 0) ? -1 : i + 1;
+}
+
+static int myCfgList(const String& s, const char* key, String* out, int maxN) {  // items in "key":[...], -1 if none
+  int i = myCfgKey(s, key);
+  if (i < 0) return -1;
+  int a = s.indexOf('[', i), b = s.indexOf(']', i);
+  if (a < 0 || b < a) return -1;
+  int n = 0;
+  String cur;
+  bool inq = false;
+  for (int p = a + 1; p <= b; p++) {
+    char c = (p == b) ? ',' : s[p];                          // the closing ']' ends the last item
+    if (c == '"') { inq = !inq; continue; }
+    if (c == ',' && !inq) {
+      cur.trim();
+      if (cur.length() || n) { if (n < maxN) out[n] = cur; n++; }
+      cur = "";
+      continue;
+    }
+    cur += c;
+  }
+  return n;
+}
+
+static void myCfgCheckInt(const String& s, const char* key, int compiled) {
+  int i = myCfgKey(s, key);
+  if (i < 0) return;
+  int v = s.substring(i).toInt();
+  if (v != compiled) Serial.printf("WARNING: config.json %s=%d but this sketch is compiled with %d (weights from the page will be refused)\n", key, v, compiled);
+}
+
+static void myReadConfig() {
+  if (!mySDavailable) return;
+  File f = SD.open("/header/config.json", FILE_READ);
+  if (!f) { Serial.println("config.json: not found - using compiled class labels"); return; }
+  size_t sz = f.size();
+  if (sz == 0 || sz > 4096) {
+    Serial.printf("config.json: size %u is outside 1..4096 - ignored\n", (unsigned)sz);
+    f.close();
+    return;
+  }
+  String s;
+  s.reserve(sz);
+  while (f.available()) s += (char)f.read();
+  f.close();
+
+  String names[TOTAL_CLASSES];
+  int n = myCfgList(s, "classes", names, TOTAL_CLASSES);
+  if (n < 0) {
+    Serial.println("config.json: no \"classes\" list - using compiled class labels");
+  } else if (n != TOTAL_CLASSES) {
+    Serial.printf("config.json: has %d classes but this sketch has %d - using compiled class labels\n", n, TOTAL_CLASSES);
+  } else {
+    bool ok = true;
+    for (int i = 0; i < TOTAL_CLASSES; i++) if (names[i].length() == 0) ok = false;
+    if (!ok) Serial.println("config.json: empty class name - using compiled class labels");
+    else {
+      for (int i = 0; i < TOTAL_CLASSES; i++) myClassLabels[i] = names[i];
+      Serial.println("config.json: class labels loaded");
+    }
+  }
+
+  myCfgCheckInt(s, "input_size",    INPUT_SIZE);
+  myCfgCheckInt(s, "conv1_filters", CONV1_FILTERS);
+  myCfgCheckInt(s, "conv2_filters", CONV2_FILTERS);
+
+  int im = myCfgKey(s, "dist_max");
+  if (im >= 0 && fabsf(s.substring(im).toFloat() - myDistMax) > 1e-4f)
+    Serial.printf("WARNING: config.json dist_max=%.4f but myDistMax=%.4f (distances will be wrong)\n", s.substring(im).toFloat(), myDistMax);
+
+  String t[NUM_DIST_CLASSES];
+  int nt = myCfgList(s, "dist_targets", t, NUM_DIST_CLASSES);
+  if (nt >= 0) {
+    bool bad = (nt != NUM_DIST_CLASSES);
+    for (int i = 0; !bad && i < NUM_DIST_CLASSES; i++) if (fabsf(t[i].toFloat() - myDistTarget[i]) > 1e-4f) bad = true;
+    if (bad) Serial.println("WARNING: config.json dist_targets differ from myDistTarget[] - paste the lines shown on the page into the sketch");
+  }
+}
+// ==CFG PARSE END==
+
+// ==DBG START==
+// web-v002: Web Serial debug frames for index-v002.html. Line based ASCII, one frame per line:
+//   @F <kind> <n> <pred> <probs|-> <logits|-> <layout> <input|-> <mapSide> <map b64|-> <jpeg b64>
+//   kind  I = inference (every 10th), C = sample just saved, P = slow live preview while collecting
+//   pred   calibrated distance in myDistUnit (raw * myDistMax when there is no calibration)
+//   probs  "distPred,confPred" (4 decimals)   logits  "raw0,raw1" (raw1 is pre-sigmoid)
+//   layout "INPUTxCONV1xCONV2"   input  centre pixel of the model input "r,g,b"
+//   map    last conv layer, max over filters, scaled 0..255 (mapSide x mapSide bytes)
+// Serial characters already used by this sketch: t T l L x X 1-9. The page sends 'D' (heartbeat
+// every 5 s) and 'd' (disconnect). Nothing extra is printed unless the page asked for frames.
+// Size: about 9-14 KB per frame (JPEG as base64 + map). Frames are sent at most about once a second
+// while collecting and every 10th inference, so roughly 10-15 KB/s worst case. Native USB is fine;
+// a UART bridge at 115200 baud (about 11 KB/s) is roughly 100x slower than native USB.
+#define MY_MAP_CELLS (CONV2_OUTPUT_SIZE * CONV2_OUTPUT_SIZE)
+static bool          myDebugOn    = false;
+static unsigned long myDebugLastD = 0;
+static unsigned long myDebugCount = 0;
+
+static void myDebugHeartbeat(char c) {
+  if (c == 'D') {
+    myDebugLastD = millis();
+    if (!myDebugOn) { myDebugOn = true; Serial.println("Debug frames ON"); }
+  } else if (c == 'd') {
+    if (myDebugOn) { myDebugOn = false; Serial.println("Debug frames OFF"); }
+  }
+}
+
+static bool myDebugActive() {
+  if (myDebugOn && millis() - myDebugLastD > 15000UL) { myDebugOn = false; Serial.println("Debug frames OFF"); }
+  return myDebugOn && Serial;
+}
+
+static void myDebugB64(const uint8_t* d, size_t n) {          // 384-byte chunks (multiple of 3) -> 512 chars
+  unsigned char out[520];                                     // 512 chars + the NUL mbedtls requires
+  for (size_t i = 0; i < n; i += 384) {
+    size_t k = (n - i < 384) ? (n - i) : 384, ol = 0;
+    if (mbedtls_base64_encode(out, sizeof(out), &ol, d + i, k) != 0) return;
+    Serial.write(out, ol);
+  }
+}
+
+static void myDebugFrame(char kind, const uint8_t* jpg, size_t jlen, bool haveModel) {
+  if (!jpg || jlen == 0 || !myDebugActive()) return;
+  Serial.printf("@F %c %lu ", kind, ++myDebugCount);
+  if (haveModel) {
+    float real = myCalibReady ? (myCalibSlope * myDistPred + myCalibOffset) : (myDistPred * myDistMax);
+    Serial.printf("%.4f %.4f,%.4f %.4f,%.4f ", real, myDistPred, myConfPred, myRegOutput[0], myRegOutput[1]);
+  } else {
+    Serial.print("- - - ");
+  }
+  Serial.printf("%dx%dx%d ", INPUT_SIZE, CONV1_FILTERS, CONV2_FILTERS);
+  if (haveModel) {
+    int c = ((INPUT_SIZE / 2) * INPUT_SIZE + INPUT_SIZE / 2) * 3;
+    Serial.printf("%.4f,%.4f,%.4f %d ", myInputBuffer[c], myInputBuffer[c + 1], myInputBuffer[c + 2], CONV2_OUTPUT_SIZE);
+    static uint8_t map[MY_MAP_CELLS];
+    float gm = 1e-6f;
+    for (int i = 0; i < MY_MAP_CELLS * CONV2_FILTERS; i++) if (myConv2_output[i] > gm) gm = myConv2_output[i];
+    for (int p = 0; p < MY_MAP_CELLS; p++) {
+      float m = myConv2_output[p];
+      for (int f = 1; f < CONV2_FILTERS; f++) { float v = myConv2_output[f * MY_MAP_CELLS + p]; if (v > m) m = v; }
+      map[p] = (m <= 0.0f) ? 0 : (uint8_t)(255.0f * m / gm);
+    }
+    myDebugB64(map, MY_MAP_CELLS);
+    Serial.print(' ');
+  } else {
+    Serial.print("- 0 - ");
+  }
+  myDebugB64(jpg, jlen);
+  Serial.println();
+}
+// ==DBG END==
+
+// web-v002: decode a camera frame, resample it like inference does and run the model,
+// so a C or P debug frame can report what the device saw. Returns false if there is no model.
+static bool myDebugPrepare(camera_fb_t* fb) {
+  if (!myWeightsTrained || !myRgbBuffer || !myInputBuffer) return false;
+  if (!fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, myRgbBuffer)) return false;
+  for (int y = 0; y < INPUT_SIZE; y++) {
+    int sy = min((int)((y + 0.5f) * 240.0f / INPUT_SIZE), 239);
+    for (int x = 0; x < INPUT_SIZE; x++) {
+      int sx = min((int)((x + 0.5f) * 240.0f / INPUT_SIZE), 239);
+      int srcIdx = (sy * 240 + sx) * 3;
+      int dstIdx = (y * INPUT_SIZE + x) * 3;
+      myInputBuffer[dstIdx]   = myRgbBuffer[srcIdx]   / 255.0f;
+      myInputBuffer[dstIdx+1] = myRgbBuffer[srcIdx+1] / 255.0f;
+      myInputBuffer[dstIdx+2] = myRgbBuffer[srcIdx+2] / 255.0f;
+    }
+  }
+  myForwardPass(myInputBuffer);
+  return true;
+}
+
 // ======================================================
 // SETUP
 // ======================================================
@@ -605,6 +857,7 @@ void setup() {
   Serial.println("\n=== XIAO ESP32-S3 Regression ML System Starting ===");
   Serial.printf("Free heap:  %d bytes\n", ESP.getFreeHeap());
   Serial.printf("Free PSRAM: %d bytes\n", ESP.getFreePsram());
+  myPrintLayout();   // web-v002
 
   myRgbBuffer = (uint8_t*)ps_malloc(240 * 240 * 3);
   if (!myRgbBuffer) Serial.println("Failed to allocate RGB buffer!");
@@ -628,6 +881,7 @@ void setup() {
     delay(2000);
   } else {
     Serial.println("SD card mounted successfully");
+    myReadConfig();   // web-v002: class folder names (and layout checks) from /header/config.json
   }
 
   camera_config_t config;
@@ -646,13 +900,29 @@ void setup() {
   config.frame_size   = FRAMESIZE_240X240;
   config.jpeg_quality = 12;
   config.fb_count     = 1;
-  esp_camera_init(&config);
-  Serial.println("Camera initialized");
-
-  sensor_t* s = esp_camera_sensor_get();
-  if (s != NULL) {
-    s->set_vflip(s, 1);
-    s->set_hmirror(s, 1);
+  esp_err_t myCamErr = esp_camera_init(&config);   // web-v002: check the result
+  if (myCamErr != ESP_OK) {
+    Serial.printf("CAMERA INIT FAILED: 0x%x - collection and inference are disabled\n", (unsigned)myCamErr);
+    u8g2.firstPage();
+    do { u8g2.drawStr(0, 15, "CAMERA ERR"); } while (u8g2.nextPage());
+    delay(2000);
+  } else {
+    myCameraOK = true;
+    Serial.println("Camera initialized");
+    sensor_t* s = esp_camera_sensor_get();
+    if (s != NULL) {
+      s->set_vflip(s, CAM_VFLIP);             // web-v002: values now come from the CAM_ defines
+      s->set_hmirror(s, CAM_HMIRROR);
+      s->set_brightness(s, CAM_BRIGHTNESS);
+      s->set_ae_level(s, CAM_AE_LEVEL);
+    } else {
+      Serial.println("WARNING: camera sensor handle is NULL - mirror/flip/brightness not applied");
+    }
+    for (int i = 0; i < CAM_WARMUP_FRAMES; i++) {   // web-v002: discard warm-up frames
+      camera_fb_t* w = esp_camera_fb_get();
+      if (w) esp_camera_fb_return(w);
+      delay(30);
+    }
   }
 
   esp_log_level_set("*",          ESP_LOG_WARN);
@@ -734,6 +1004,11 @@ void myActionCollect(int classIdx) {
     u8g2.firstPage(); do { u8g2.drawStr(0, 15, "No SD card"); } while (u8g2.nextPage());
     delay(2000); myResetMenuState(); return;
   }
+  if (!myCameraOK) {   // web-v002
+    Serial.println("Camera not available - cannot collect");
+    u8g2.firstPage(); do { u8g2.drawStr(0, 15, "CAMERA ERR"); } while (u8g2.nextPage());
+    delay(2000); myResetMenuState(); return;
+  }
   Serial.printf("\n>>> Collection: %s\n", myClassLabels[classIdx].c_str());
   Serial.println("  TAP = Capture | 3+ taps = Exit | Serial T=capture L=exit");
   myResetTouchState();
@@ -753,7 +1028,7 @@ void myActionCollect(int classIdx) {
     root.close();
   }
 
-  unsigned long lastDrain = 0, lastOLED = 0;
+  unsigned long lastDrain = 0, lastOLED = 0, lastDbg = 0;   // web-v002: lastDbg
   bool oledDirty = false, shouldCapture = false;
 
   while (true) {
@@ -768,6 +1043,11 @@ void myActionCollect(int classIdx) {
               oledDirty = true; lastOLED = now;
             }
           }
+          if (myDebugActive() && now - lastDbg >= 1000) {   // web-v002: slow live preview frame
+            lastDbg = now;
+            bool ok = myDebugPrepare(fb);
+            myDebugFrame('P', fb->buf, fb->len, ok);
+          }
           esp_camera_fb_return(fb);
         }
       }
@@ -778,6 +1058,7 @@ void myActionCollect(int classIdx) {
       char c = Serial.read();
       if (c == 'l' || c == 'L') { myResetMenuState(); return; }
       else if (c == 't' || c == 'T') shouldCapture = true;
+      else myDebugHeartbeat(c);   // web-v002
     }
     int ta = myCheckTouchInput();
     if (ta == 2) { myResetMenuState(); return; }
@@ -794,6 +1075,10 @@ void myActionCollect(int classIdx) {
           file.close();
           count++;
           Serial.printf("Saved: %s (Total: %d)\n", fn.c_str(), count);
+          if (myDebugActive()) {   // web-v002: frame for the sample just saved
+            bool ok = myDebugPrepare(fb);
+            myDebugFrame('C', fb->buf, fb->len, ok);
+          }
           myDisplayImageOnOLED(fb, count);
           delay(300); lastOLED = millis();
         }
@@ -1257,8 +1542,6 @@ void myActionTrain() {
     }
 
 
-// ---- NEW (v003) — replace those two lines with: ----
-
     // CHANGE-3c: calibration pass — run forward on all training images,
     // accumulate mean raw myDistPred per distance class, then fit line.
     {
@@ -1386,6 +1669,11 @@ void myActionInfer() {
     } while (u8g2.nextPage());
     delay(3000); myResetMenuState(); return;
   }
+  if (!myCameraOK) {   // web-v002
+    Serial.println("Camera not available - cannot infer");
+    u8g2.firstPage(); do { u8g2.drawStr(0, 15, "CAMERA ERR"); } while (u8g2.nextPage());
+    delay(2000); myResetMenuState(); return;
+  }
 
   Serial.println("\n>>> Inference mode (Regression)");
   Serial.printf("  Unit: %s  Max: %.1f  Conf threshold: %.2f\n",
@@ -1417,6 +1705,7 @@ void myActionInfer() {
 
   unsigned long frameTimes[10];
   int frameIndex = 0;
+  unsigned long myInferCount = 0;   // web-v002: every 10th inference sends a debug frame
 
   while (true) {
     unsigned long frameStart = millis();
@@ -1424,6 +1713,7 @@ void myActionInfer() {
     if (Serial.available()) {
       char c = Serial.read();
       if (c == 't' || c == 'T' || c == 'l' || c == 'L') { myResetMenuState(); return; }
+      myDebugHeartbeat(c);   // web-v002
     }
 
     camera_fb_t* fb = esp_camera_fb_get();
@@ -1444,6 +1734,9 @@ void myActionInfer() {
       }
 
       myForwardPass(myInputBuffer);
+
+      if (myDebugActive() && (++myInferCount % 10 == 0))   // web-v002: debug frame from this exact frame
+        myDebugFrame('I', fb->buf, fb->len, true);
 
       // CHANGE-3d: use calibration line instead of raw * myDistMax.
       // myCalibSlope/Offset were fitted to the actual network outputs after
@@ -1587,6 +1880,8 @@ void myHandleMenuNavigation() {
       }
     } else if (c == 'l' || c == 'L') {
       myIsSelected = true; myLastActivityTime = now; myExecuteMenuItem(myMenuIndex);
+    } else {
+      myDebugHeartbeat(c);   // web-v002
     }
   }
 
