@@ -1,0 +1,1187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>index-v002: SD-card web trainer for vision regression (distance + confidence)</title>
+<style>
+:root{--bg:#14161a;--panel:#1d2026;--line:#333a44;--fg:#e6e8ec;--dim:#8d96a3;--acc:#4da3ff;--warn:#ffb454;--ok:#7bd88f;--bad:#ff5d5d}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{padding:14px 20px;border-bottom:1px solid var(--line)}
+header h1{margin:0;font-size:18px}
+header p{margin:4px 0 0;color:var(--dim);font-size:13px}
+main{max-width:1100px;margin:0 auto;padding:10px 16px 60px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:14px 0}
+h2{margin:0 0 10px;font-size:16px;color:var(--acc)}
+button,select,input,textarea{font:inherit;color:var(--fg);background:#262b33;border:1px solid var(--line);border-radius:7px;padding:8px 12px}
+button{cursor:pointer;min-height:40px}
+button:hover:not(:disabled){border-color:var(--acc)}
+button:disabled{opacity:.45;cursor:default}
+button.small{min-height:28px;padding:2px 8px;font-size:13px}
+button.primary{background:#1e4f86;border-color:#2f73bb}
+button.stop{background:#6b2424;border-color:#9a3a3a}
+button.rec{background:#c62828;border-color:#ff6b6b;color:#fff}
+input[type=number]{width:7.5em}
+label{margin-right:12px;white-space:nowrap}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
+.dim{color:var(--dim)}.warn{color:var(--warn)}.ok{color:var(--ok)}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{border-bottom:1px solid var(--line);padding:5px 8px;text-align:left;vertical-align:middle}
+th{color:var(--dim);font-weight:600}
+.th{width:44px;height:44px;object-fit:cover;border-radius:4px;margin:1px;cursor:pointer;border:1px solid var(--line)}
+.grid{display:flex;flex-wrap:wrap;gap:2px;padding:6px 0}
+details{border-top:1px solid var(--line);padding:6px 0}
+summary{cursor:pointer}
+textarea{width:100%;font:12px/1.4 ui-monospace,Consolas,monospace}
+canvas{background:#0f1115;border:1px solid var(--line);border-radius:6px;max-width:100%}
+.camwrap{position:relative;width:240px;height:240px;overflow:hidden;border-radius:8px;border:1px solid var(--line);background:#000}
+.camwrap video{width:240px;height:240px;object-fit:cover}
+#recBadge{display:none;position:absolute;top:8px;left:8px;background:#c62828;color:#fff;padding:2px 8px;border-radius:5px;font-weight:700;font-size:13px}
+#flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;transition:opacity .08s}
+.gi{display:inline-block;width:92px;margin:3px;font-size:11px;text-align:center;cursor:pointer}
+.gi img{width:92px;height:92px;object-fit:cover;border-radius:5px;border:1px solid var(--line)}
+.bar{height:12px;background:#0f1115;border:1px solid var(--line);border-radius:6px;overflow:hidden;margin-top:6px}
+.bar div{height:100%;background:var(--acc)}
+#liveBanner{font-size:22px;margin:4px 0}
+.modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:10;align-items:center;justify-content:center;padding:14px;overflow:auto}
+.modal.open{display:flex}
+.modal .box{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;max-width:560px;width:100%}
+.modal img,.modal canvas.big{width:100%;max-width:480px;display:block;margin:0 auto 8px;border-radius:6px;image-rendering:auto}
+.cols{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start}
+</style>
+</head>
+<body>
+<header>
+<h1>index-v002: SD-card web trainer, vision regression (distance + confidence)</h1>
+<p>Pairs with firmware-v002.ino. Desktop Chrome or Edge. Add data, train, analyze, clean, debug; weights go back to the SD card unchanged.</p>
+</header>
+<main>
+
+<section id="s1"><h2>1. Data source</h2>
+<div class="row"><button id="btnPickDir" class="primary">Pick SD folder</button>
+<label class="dim">or <input type="file" id="fileZip" accept=".zip"> Load .zip</label></div>
+<div class="dim" id="fsNote">Pick the root of the SD card (the folder that contains images/ and header/). Chrome or Edge asks for read/write permission.</div>
+<div id="summary" style="margin-top:8px">Nothing loaded yet.</div></section>
+
+<section id="s2"><h2>2. Classes and data</h2>
+<div id="classTable"></div>
+<div class="row"><label>max distance <input type="number" step="any" id="inMax" value="10"></label>
+<label>unit <input id="inUnit" value="cm" style="width:5em"></label>
+<label><input type="checkbox" id="chkAutoMax" checked> max = largest class distance (firmware convention: maps to 1.0)</label></div>
+<div class="row"><input id="inNewName" placeholder="new class folder name" style="width:14em"><input type="number" step="any" id="inNewVal" placeholder="distance" style="width:7em"><button id="btnAddClass">Add class</button>
+<span class="dim">Firmware limit: one target per class folder. To give an image a different distance, move it to that class (inspector).</span></div>
+<div class="dim">Lines to paste into the sketch (layout, distances, folder names); then reflash:</div>
+<textarea id="fwLines" rows="8" readonly></textarea>
+<div class="cols" style="margin-top:10px">
+<div><div class="camwrap"><video id="vid" autoplay muted playsinline></video><div id="recBadge">REC</div><div id="flash"></div></div>
+<div class="row"><button id="btnCam">Start camera</button></div></div>
+<div>
+<div class="row"><label>capture into <select id="selCapCls"></select></label></div>
+<div class="row"><button id="btnCap" class="primary">Capture (Space)</button><button id="btnBurst">Burst 10 (B)</button><label>delay <input type="number" id="inDelay" value="0" min="0" style="width:5em"> ms</label></div>
+<div class="row"><label><input type="checkbox" id="chkMirror" checked> Mirror (firmware CAM_HMIRROR = 1)</label>
+<label><input type="checkbox" id="chkVflip"> Flip vertical</label><label>brightness x <input type="number" id="inBright" value="1" step="0.05" min="0.5" max="2" style="width:5em"></label></div>
+<div class="dim" style="max-width:520px">Frames are square-cropped to 240x240, JPEG-encoded and decoded again like stored images. The device flips its sensor (CAM_VFLIP) to correct how the board is mounted, so the page does not flip by default. Mirror, flip and brightness need bench tuning so device images and page images look alike. Browser files are named img_w... and sort differently from device files (img_ and milliseconds), which can put the whole "last N" hold-out in one source.</div>
+</div></div>
+<div class="row"><button id="btnReview">Review images</button><span class="dim">step through a class, X marks a bad sample</span></div>
+<div id="sampleBrowser"></div></section>
+
+<section id="s3"><h2>3. Train</h2>
+<div class="row"><label>INPUT_SIZE <input type="number" id="inInput" value="64" step="2" min="8" max="240"></label>
+<label>CONV1_FILTERS <input type="number" id="inC1" value="4" min="1" max="32"></label>
+<label>CONV2_FILTERS <input type="number" id="inC2" value="8" min="1" max="32"></label></div>
+<div id="layoutMsg" class="dim"></div>
+<div class="row"><label>learning rate <input type="number" id="inLR" value="0.0003" step="0.0001"></label>
+<label>batch <input type="number" id="inBatch" value="6" min="1"></label>
+<label>epochs <input type="number" id="inEpochs" value="60" min="1"></label>
+<label>validation <select id="selValMode"><option value="last">last N per class (firmware)</option><option value="pct">percent of smallest class</option></select></label>
+<label><input type="number" id="inValN" value="3" min="0" step="1" style="width:5em"> N or %</label></div>
+<div class="row"><span class="dim">Browser-only training knobs (not in the firmware):</span>
+<label>dropout <input type="number" id="inDrop" value="0" min="0" max="0.9" step="0.05" style="width:5em"></label>
+<label>brightness jitter % <input type="number" id="inAugB" value="0" min="0" style="width:5em"></label>
+<label>shift px <input type="number" id="inAugS" value="0" min="0" style="width:5em"></label>
+<label><input type="checkbox" id="chkContinue"> continue from the model in memory</label></div>
+<div class="row"><button id="btnTrain" class="primary">Train</button><button id="btnPause" disabled>Pause</button><button id="btnStop" class="stop" disabled>STOP</button>
+<span class="dim">STOP keeps the model in memory and does not save.</span></div>
+<div id="trainStatus" class="dim"></div>
+<div id="splitInfo" class="dim"></div>
+<div class="row"><canvas id="cvLoss" width="340" height="150"></canvas><canvas id="cvMae" width="340" height="150"></canvas><canvas id="cvAcc" width="340" height="150"></canvas></div>
+<div class="dim">Gradients are summed over the batch like the firmware. Training steps are bounded and a non-finite loss rolls back to the last good epoch with half the learning rate.</div></section>
+
+<section id="s4"><h2>4. Analyze</h2>
+<div id="modelInfo" class="dim"></div>
+<div class="row"><label>evaluate on <select id="selEval"><option value="val">validation set</option><option value="all">all samples (finds bad labels)</option></select></label>
+<button id="btnEval">Update evaluation</button><button id="btnRefit">Refit calibration</button>
+<label>heatmap <select id="selHeatMode"><option value="max">max over filters</option><option value="mean">mean over filters</option></select></label>
+<label><input type="checkbox" id="chkOverlay" checked> overlay</label></div>
+<div class="row"><label>parity self-test sample <select id="selPar" style="max-width:320px"></select></label><button id="btnPar">Print parity line</button></div>
+<div class="cols"><canvas id="cvScatter" width="380" height="300"></canvas><div style="flex:1;min-width:300px"><div id="metrics"></div></div></div>
+<div id="classStats" style="margin-top:8px"></div>
+<div id="warnings"></div>
+<h3 style="font-size:14px;margin:12px 0 4px">Worst residuals <span class="dim">(blank images ranked by false confidence)</span></h3>
+<div id="gallery"></div></section>
+
+<section id="s5"><h2>5. Infer (live)</h2>
+<div class="cols"><div class="camwrap"><video id="vid2" autoplay muted playsinline></video></div><canvas id="cvLive" width="240" height="240"></canvas>
+<div style="flex:1;min-width:240px"><div id="liveBanner" class="dim">Start the camera, then live inference.</div><div id="liveBars"></div></div></div>
+<div class="row"><button id="btnLive">Start live inference</button></div></section>
+
+<section id="s6"><h2>6. Save</h2>
+<div class="row"><button id="btnSaveW" class="primary">Save weights to header/</button><button id="btnSaveCfg">Write config.json only</button>
+<button id="btnSaveZip">Save .zip</button><label><input type="checkbox" id="chkImgs" checked> include images</label></div>
+<div class="dim">Saving never happens automatically. An existing header/myWeights.bin is copied to myWeights.bin.bak first. Weights file = 6 float32 arrays (little-endian) then calibration slope and offset.</div>
+<div id="saveMsg"></div></section>
+
+<section id="s7"><h2>7. Console</h2>
+<textarea id="console" rows="9" readonly></textarea></section>
+
+<section id="s8"><h2>8. Serial monitor (Web Serial)</h2>
+<div class="row"><button id="btnSerConn">Connect</button><button id="btnSerDisc" disabled>Disconnect</button><span class="dim">115200 baud</span>
+<label><input type="checkbox" id="chkDbg" checked> ask the device for debug frames</label></div>
+<div class="dim" id="serNote">Close the Arduino IDE serial monitor first. Opening the port can reboot the board. Chrome or Edge only. Debug frames over a UART bridge are about 100 times slower than native USB.</div>
+<textarea id="serOut" rows="10" readonly></textarea>
+<div class="row"><input id="serIn" placeholder="t = next, l = select, 1-9 = direct" style="flex:1;min-width:200px"><button id="btnSerSend">Send</button></div>
+<h3 style="font-size:14px;margin:12px 0 4px">Device view</h3>
+<div class="cols"><img id="devImg" width="240" height="240" alt="" style="background:#000;border-radius:6px"><canvas id="cvDevMap" width="240" height="240"></canvas><div id="devTxt" class="dim" style="flex:1;min-width:260px">Waiting for a debug frame.</div></div></section>
+</main>
+
+<div id="insp" class="modal"><div class="box">
+<canvas id="cvInsp" class="big" width="480" height="480"></canvas>
+<div id="inspInfo" style="font-size:13px"></div>
+<div class="row"><select id="selInspMove"></select><button id="btnInspMove">Move to class</button><button id="btnInspDel" class="stop">Delete</button><button id="btnInspClose">Close</button></div></div></div>
+
+<div id="rev" class="modal"><div class="box">
+<div class="row"><select id="selRevCls"></select><label><input type="checkbox" id="chkSusp"> suspicious first</label><span id="revPos" class="dim"></span></div>
+<img id="revImg" alt="">
+<div id="revInfo" style="font-size:13px;min-height:40px"></div>
+<div class="row"><button id="btnRevPrev">&larr;</button><button id="btnRevNext">&rarr;</button><button id="btnRevMark">Mark / unmark</button><button id="btnRevDel" class="stop">Delete marked (0)</button><button id="btnRevClose">Close</button></div>
+<div class="dim">Arrow keys move. X marks the sample as bad and advances. Marking deletes nothing.</div></div></div>
+
+<script>
+/* ==CORE START== */
+// Everything here has no DOM use, so it can be tested in Node. It mirrors firmware-v002.ino line by line.
+const F32 = Math.fround;
+const CONF_W = 0.5, DIST_CLIP_MIN = -0.1, DIST_CLIP_MAX = 2.0, CONF_THR = 0.5;   // firmware constants
+const MAX_STEP = 0.05;                                                          // browser-only safety bound per weight update
+
+function clipv(v, mn = -100, mx = 100) {           // firmware clip_value: NaN/Inf -> 0
+  if (v !== v || v === Infinity || v === -Infinity) return 0;
+  return v < mn ? mn : (v > mx ? mx : v);
+}
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+/* ---------- layout (compile-time #defines in the firmware) ---------- */
+function layoutOf(a) {
+  const IN = a.input | 0, C1 = a.c1 | 0, C2 = a.c2 | 0;
+  const o1 = IN - 2, p1 = Math.floor(o1 / 2), o2 = p1 - 2;
+  const L = { IN, C1, C2, o1, p1, o2, flat: o2 * o2 * C2, nC1w: 27 * C1, nC2w: 9 * C1 * C2 };
+  L.nOw = L.flat * 2;
+  L.floats = L.nC1w + C1 + L.nC2w + C2 + L.nOw + 2;
+  L.bytes = L.floats * 4; L.bytesCal = L.bytes + 8;
+  L.reason = '';
+  if (IN % 2) L.reason = 'INPUT_SIZE must be even (2x2 pool)';
+  else if (IN < 8 || IN > 240) L.reason = 'INPUT_SIZE must be 8..240';
+  else if (C1 < 1 || C1 > 32 || C2 < 1 || C2 > 32) L.reason = 'filter counts must be 1..32';
+  else if (o2 < 1) L.reason = 'conv2 output would be empty';
+  L.valid = L.reason === '';
+  return L;
+}
+function layoutText(L) { return `${L.IN}x${L.C1}x${L.C2}`; }
+function layoutDefines(a) { return `#define INPUT_SIZE ${a.input}\n#define CONV1_FILTERS ${a.c1}\n#define CONV2_FILTERS ${a.c2}`; }
+function layoutsFitting(bytes) {                     // every layout whose file is `bytes` (with or without calibration)
+  const out = [];
+  for (let IN = 8; IN <= 128; IN += 2) for (let C1 = 1; C1 <= 32; C1++) for (let C2 = 1; C2 <= 32; C2++) {
+    const L = layoutOf({ input: IN, c1: C1, c2: C2 });
+    if (L.valid && (L.bytes === bytes || L.bytesCal === bytes)) out.push({ input: IN, c1: C1, c2: C2 });
+  }
+  return out;
+}
+
+/* ---------- model ---------- */
+function newModel(a, seed, F = Float32Array) {
+  const L = layoutOf(a); const rnd = mulberry32(seed || 1);
+  const m = { L, F, calib: { slope: 0, offset: 0, ready: false },
+    c1w: new F(L.nC1w), c1b: new F(L.C1), c2w: new F(L.nC2w), c2b: new F(L.C2), ow: new F(L.nOw), ob: new F(2) };
+  const c1 = Math.sqrt(2 / (9 * 3)), c2 = Math.sqrt(2 / (9 * L.C1)), d = Math.sqrt(2 / L.flat);
+  for (let i = 0; i < L.nC1w; i++) m.c1w[i] = (rnd() - 0.5) * 2 * c1;
+  for (let i = 0; i < L.nC2w; i++) m.c2w[i] = (rnd() - 0.5) * 2 * c2;
+  for (let i = 0; i < L.nOw; i++) m.ow[i] = (rnd() - 0.5) * 2 * d;
+  m.ob[0] = 0.9; m.ob[1] = 0;                        // firmware warm start of the distance bias
+  return m;
+}
+const PARAMS = ['c1w', 'c1b', 'c2w', 'c2b', 'ow', 'ob'];
+function makeBuf(L, F = Float32Array) {
+  return { c1o: new F(L.o1 * L.o1 * L.C1), p1o: new F(L.p1 * L.p1 * L.C1), c2o: new F(L.flat), flat: new F(L.flat),
+    raw0: 0, raw1: 0, dist: 0, conf: 0 };
+}
+function makeGrad(L, F = Float32Array) {
+  return { c1w: new F(L.nC1w), c1b: new F(L.C1), c2w: new F(L.nC2w), c2b: new F(L.C2), ow: new F(L.nOw), ob: new F(2),
+    dense: new F(L.flat), c2g: new F(L.flat), p1g: new F(L.p1 * L.p1 * L.C1), c1g: new F(L.o1 * L.o1 * L.C1) };
+}
+function makeOpt(m) { const o = { m: {}, v: {} }; for (const k of PARAMS) { o.m[k] = new m.F(m[k].length); o.v[k] = new m.F(m[k].length); } return o; }
+
+function forward(m, input, B, mask) {
+  const { IN, C1, C2, o1, p1, o2, flat } = m.L, c1w = m.c1w, c1b = m.c1b, c2w = m.c2w, c2b = m.c2b;
+  const c1o = B.c1o, p1o = B.p1o, c2o = B.c2o;
+  for (let f = 0; f < C1; f++) {
+    const ob = f * o1 * o1;
+    for (let y = 0; y < o1; y++) for (let x = 0; x < o1; x++) {
+      let sum = c1b[f];
+      for (let ky = 0; ky < 3; ky++) for (let kx = 0; kx < 3; kx++) {
+        const ip = ((y + ky) * IN + (x + kx)) * 3, wp = f * 27 + ky * 9 + kx * 3;
+        sum += input[ip] * c1w[wp] + input[ip + 1] * c1w[wp + 1] + input[ip + 2] * c1w[wp + 2];
+      }
+      sum = clipv(sum); c1o[ob + y * o1 + x] = sum > 0 ? sum : 0.1 * sum;
+    }
+  }
+  for (let f = 0; f < C1; f++) {
+    const ib = f * o1 * o1, ob = f * p1 * p1;
+    for (let y = 0; y < p1; y++) for (let x = 0; x < p1; x++) {
+      const iy = y * 2, ix = x * 2;
+      let mv = c1o[ib + iy * o1 + ix];
+      mv = Math.max(mv, c1o[ib + iy * o1 + ix + 1], c1o[ib + (iy + 1) * o1 + ix], c1o[ib + (iy + 1) * o1 + ix + 1]);
+      p1o[ob + y * p1 + x] = mv;
+    }
+  }
+  for (let f = 0; f < C2; f++) {
+    const ob = f * o2 * o2;
+    for (let y = 0; y < o2; y++) for (let x = 0; x < o2; x++) {
+      let sum = c2b[f];
+      for (let c = 0; c < C1; c++) {
+        const ib = c * p1 * p1, wb = f * C1 * 9 + c * 9;
+        for (let ky = 0; ky < 3; ky++) for (let kx = 0; kx < 3; kx++) sum += p1o[ib + (y + ky) * p1 + (x + kx)] * c2w[wb + ky * 3 + kx];
+      }
+      sum = clipv(sum); c2o[ob + y * o2 + x] = sum > 0 ? sum : 0.1 * sum;
+    }
+  }
+  const fl = B.flat;
+  if (mask) for (let i = 0; i < flat; i++) fl[i] = c2o[i] * mask[i]; else for (let i = 0; i < flat; i++) fl[i] = c2o[i];
+  const raw = [0, 0], rnd = m.F === Float32Array ? F32 : (x => x);
+  for (let n = 0; n < 2; n++) {
+    let sum = 0; const wb = n * flat;
+    for (let i = 0; i < flat; i++) sum += fl[i] * m.ow[wb + i];
+    raw[n] = rnd(rnd(sum) + m.ob[n]);
+  }
+  B.raw0 = raw[0]; B.raw1 = raw[1];
+  B.dist = (raw[0] !== raw[0] || raw[0] === Infinity || raw[0] === -Infinity) ? 0 : raw[0];   // linear, no clip: can exceed 1.0
+  B.conf = 1 / (1 + Math.exp(-clipv(raw[1], -15, 15)));
+}
+
+function sampleLoss(B, tD, tC) {                     // MSE(distance) + 0.5 * BCE(confidence), as logged by the firmware
+  const e = B.dist - tD;
+  const bce = -(tC * Math.log(B.conf + 1e-7) + (1 - tC) * Math.log(1 - B.conf + 1e-7));
+  return e * e + CONF_W * bce;
+}
+
+// Backward pass. Gradients are SUMMED over the batch (not averaged) like the firmware.
+function backward(m, input, B, G, tD, tC, mask) {
+  const { IN, C1, C2, o1, p1, o2, flat } = m.L;
+  G.dense.fill(0);
+  const dg = clipv(2 * (B.dist - tD), DIST_CLIP_MIN * 10, DIST_CLIP_MAX * 10);   // gradient clip quirk: [-1, 20]
+  const cg = CONF_W * (B.conf - tC);
+  const gs = [dg, cg];
+  for (let n = 0; n < 2; n++) {
+    const g = gs[n], wb = n * flat; G.ob[n] += g;
+    for (let i = 0; i < flat; i++) { G.ow[wb + i] += g * B.flat[i]; G.dense[i] += g * m.ow[wb + i]; }
+  }
+  const c2o = B.c2o, c2g = G.c2g, p1g = G.p1g, c1g = G.c1g, p1o = B.p1o, c1o = B.c1o;
+  for (let i = 0; i < flat; i++) { const d = mask ? G.dense[i] * mask[i] : G.dense[i]; c2g[i] = d * (c2o[i] > 0 ? 1 : 0.1); }
+  p1g.fill(0);
+  for (let f = 0; f < C2; f++) {
+    const ob = f * o2 * o2;
+    for (let y = 0; y < o2; y++) for (let x = 0; x < o2; x++) {
+      const grad = c2g[ob + y * o2 + x]; G.c2b[f] += grad;
+      for (let c = 0; c < C1; c++) {
+        const ib = c * p1 * p1, wb = f * C1 * 9 + c * 9;
+        for (let ky = 0; ky < 3; ky++) for (let kx = 0; kx < 3; kx++) {
+          const pi = ib + (y + ky) * p1 + (x + kx), wi = wb + ky * 3 + kx;
+          G.c2w[wi] += grad * p1o[pi]; p1g[pi] += grad * m.c2w[wi];
+        }
+      }
+    }
+  }
+  c1g.fill(0);                                        // max-pool backward: every tied maximum receives the gradient
+  for (let f = 0; f < C1; f++) {
+    const ib = f * o1 * o1, ob = f * p1 * p1;
+    for (let y = 0; y < p1; y++) for (let x = 0; x < p1; x++) {
+      const iy = y * 2, ix = x * 2, pv = p1o[ob + y * p1 + x], g = p1g[ob + y * p1 + x];
+      const a = ib + iy * o1 + ix, b = ib + (iy + 1) * o1 + ix;
+      if (c1o[a] === pv) c1g[a] += g; if (c1o[a + 1] === pv) c1g[a + 1] += g;
+      if (c1o[b] === pv) c1g[b] += g; if (c1o[b + 1] === pv) c1g[b + 1] += g;
+    }
+  }
+  for (let i = 0; i < o1 * o1 * C1; i++) c1g[i] *= (c1o[i] > 0 ? 1 : 0.1);
+  for (let f = 0; f < C1; f++) {
+    const ob = f * o1 * o1;
+    for (let y = 0; y < o1; y++) for (let x = 0; x < o1; x++) {
+      const grad = c1g[ob + y * o1 + x]; G.c1b[f] += grad;
+      for (let ky = 0; ky < 3; ky++) for (let kx = 0; kx < 3; kx++) {
+        const ip = ((y + ky) * IN + (x + kx)) * 3, wp = f * 27 + ky * 9 + kx * 3;
+        G.c1w[wp] += grad * input[ip]; G.c1w[wp + 1] += grad * input[ip + 1]; G.c1w[wp + 2] += grad * input[ip + 2];
+      }
+    }
+  }
+}
+
+function adam(w, g, mm, vv, step, lr) {             // firmware Adam (eps 1e-6, clip +-10) + browser-only safety
+  const b1 = 0.9, b2 = 0.999, eps = 1e-6;
+  const lrt = lr * Math.sqrt(1 - Math.pow(b2, step)) / (1 - Math.pow(b1, step));
+  for (let i = 0; i < w.length; i++) {
+    let gi = g[i]; if (!isFinite(gi)) gi = 0;       // non-finite gradient -> 0
+    mm[i] = b1 * mm[i] + (1 - b1) * gi; vv[i] = b2 * vv[i] + (1 - b2) * gi * gi;
+    let d = lrt * mm[i] / (Math.sqrt(vv[i]) + eps);
+    if (!isFinite(d)) d = 0; else if (d > MAX_STEP) d = MAX_STEP; else if (d < -MAX_STEP) d = -MAX_STEP;
+    w[i] = clipv(w[i] - d, -10, 10);
+  }
+}
+function modelFinite(m) { for (const k of PARAMS) { const a = m[k]; for (let i = 0; i < a.length; i++) if (!isFinite(a[i])) return false; } return true; }
+function snapshot(m, o) { const s = { w: {}, m: {}, v: {} }; for (const k of PARAMS) { s.w[k] = m[k].slice(); s.m[k] = o.m[k].slice(); s.v[k] = o.v[k].slice(); } return s; }
+function restore(m, o, s) { for (const k of PARAMS) { m[k].set(s.w[k]); o.m[k].set(s.m[k]); o.v[k].set(s.v[k]); } }
+
+/* ---------- spec (classes and distance targets) ---------- */
+// spec = { names:[blank, ...], dist:[real distance per non-blank class], max, unit }
+function targetNorm(spec, i) { return F32(spec.dist[i] / spec.max); }          // firmware myDistTarget[i]
+function targetsOf(spec, cls) { return cls === 0 ? { d: 0, c: 0 } : { d: targetNorm(spec, cls - 1), c: 1 }; }
+function specValid(spec) {
+  if (!(spec.max > 0)) return 'max distance must be > 0';
+  for (let i = 0; i < spec.dist.length; i++) if (!isFinite(spec.dist[i])) return `class "${spec.names[i + 1]}" has no distance value`;
+  return '';
+}
+function realDist(model, spec, dist) {               // firmware inference: calibration line, else raw * myDistMax
+  const c = model.calib;
+  return c.ready ? F32(F32(c.slope * F32(dist)) + c.offset) : F32(F32(dist) * F32(spec.max));
+}
+function fitCalib(raws, reals, n, max) {             // firmware myFitCalibration in float32
+  if (n < 2) return { slope: F32(max), offset: 0, ready: true };
+  let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (let i = 0; i < n; i++) {
+    const x = F32(raws[i]), y = F32(reals[i]);
+    sx = F32(sx + x); sy = F32(sy + y); sxx = F32(sxx + F32(x * x)); sxy = F32(sxy + F32(x * y));
+  }
+  const denom = F32(F32(n * sxx) - F32(sx * sx)); let slope, offset;
+  if (Math.abs(denom) < 1e-6) { slope = sx > 1e-4 ? F32(sy / sx) : F32(max); offset = 0; }
+  else { slope = F32(F32(F32(n * sxy) - F32(sx * sy)) / denom); offset = F32(F32(sy - F32(slope * sx)) / n); }
+  return { slope, offset, ready: true };
+}
+function calibrateModel(model, train, spec) {        // forward on training images only (after the split), mean raw per class
+  const N = spec.dist.length, sum = new Array(N).fill(0), cnt = new Array(N).fill(0), B = makeBuf(model.L, model.F);
+  for (const s of train) { if (s.cls === 0) continue; forward(model, s.input, B); const ci = s.cls - 1; sum[ci] = F32(sum[ci] + F32(B.dist)); cnt[ci]++; }
+  const raws = [], reals = [], anchors = [];
+  for (let ci = 0; ci < N; ci++) if (cnt[ci] > 0) {
+    const r = F32(sum[ci] / cnt[ci]), t = F32(targetNorm(spec, ci) * F32(spec.max));
+    raws.push(r); reals.push(t); anchors.push({ cls: ci + 1, raw: r, real: t });
+  }
+  model.calib = fitCalib(raws, reals, raws.length, spec.max);
+  return anchors;
+}
+
+/* ---------- data split (firmware rule) ---------- */
+function cmpPath(a, b) { return a < b ? -1 : (a > b ? 1 : 0); }                  // strcmp on ASCII paths, like Arduino String <
+function splitSamples(samples, nClasses, mode, val) {   // mode 'last' (firmware: last N per class by path) | 'pct' (percent of smallest class)
+  const byCls = Array.from({ length: nClasses }, () => []);
+  for (const s of samples) byCls[s.cls].push(s);
+  for (const a of byCls) a.sort((x, y) => cmpPath(x.path, y.path));
+  let n;
+  if (mode === 'pct') { const smallest = Math.min(...byCls.map(a => a.length).filter(x => x > 0), Infinity); n = isFinite(smallest) ? Math.max(1, Math.floor(smallest * val / 100)) : 0; }
+  else n = val | 0;
+  const train = [], vset = [], per = [], warnings = [];
+  for (let c = 0; c < nClasses; c++) {
+    const a = byCls[c]; let k = n > 0 ? Math.min(n, a.length) : 0;
+    if (mode === 'pct' && a.length > 0) k = Math.min(k, a.length - 1);          // always leave one training sample
+    const tr = a.slice(0, a.length - k), va = a.slice(a.length - k);
+    train.push(...tr); vset.push(...va); per.push({ train: tr.length, val: va.length });
+    if (a.length > 0 && tr.length === 0) warnings.push(c);
+  }
+  return { train, val: vset, per, noTrain: warnings };
+}
+
+/* ---------- training ---------- */
+function resampleRgb(rgb, IN) {                      // rgb: 240*240*3 Uint8; firmware nearest pixel, RGB order, /255
+  const out = new Float32Array(IN * IN * 3);
+  for (let y = 0; y < IN; y++) {
+    const sy = Math.min(Math.floor(F32(F32(F32(y + 0.5) * 240) / IN)), 239);
+    for (let x = 0; x < IN; x++) {
+      const sx = Math.min(Math.floor(F32(F32(F32(x + 0.5) * 240) / IN)), 239);
+      const s = (sy * 240 + sx) * 3, d = (y * IN + x) * 3;
+      out[d] = rgb[s] / 255; out[d + 1] = rgb[s + 1] / 255; out[d + 2] = rgb[s + 2] / 255;
+    }
+  }
+  return out;
+}
+function augment(src, dst, IN, rnd, brightPct, shiftPx) {   // browser-only training augmentation
+  const b = 1 + (rnd() * 2 - 1) * brightPct / 100, dx = shiftPx ? Math.round((rnd() * 2 - 1) * shiftPx) : 0, dy = shiftPx ? Math.round((rnd() * 2 - 1) * shiftPx) : 0;
+  for (let y = 0; y < IN; y++) {
+    const sy = Math.min(IN - 1, Math.max(0, y + dy));
+    for (let x = 0; x < IN; x++) {
+      const sx = Math.min(IN - 1, Math.max(0, x + dx)), s = (sy * IN + sx) * 3, d = (y * IN + x) * 3;
+      for (let c = 0; c < 3; c++) { const v = src[s + c] * b; dst[d + c] = v < 0 ? 0 : (v > 1 ? 1 : v); }
+    }
+  }
+}
+function evaluate(model, samples, spec) {            // one record per sample
+  const B = makeBuf(model.L, model.F), out = [];
+  for (const s of samples) {
+    forward(model, s.input, B);
+    const t = targetsOf(spec, s.cls), real = realDist(model, spec, B.dist), blank = s.cls === 0;
+    out.push({ s, cls: s.cls, dist: B.dist, conf: B.conf, raw0: B.raw0, raw1: B.raw1, real, tD: t.d, tC: t.c,
+      trueReal: blank ? null : F32(t.d * F32(spec.max)), blank, errNorm: Math.abs(B.dist - t.d),
+      score: blank ? B.conf : Math.abs(B.dist - t.d) });
+  }
+  return out;
+}
+function summarize(res, spec) {
+  const r = { n: res.length, fwMae: 0, confAcc: 0, dist: { n: 0, maeN: 0, rmseN: 0, maeR: 0, rmseR: 0 }, conf: { mae: 0, rmse: 0 }, perClass: [] };
+  if (!res.length) return r;
+  const pc = spec.names.map(() => ({ n: 0, sumReal: 0, sumConf: 0, absR: 0, okConf: 0 }));
+  let sN = 0, sqN = 0, sR = 0, sqR = 0, cA = 0, cSq = 0, cOk = 0, fw = 0;
+  for (const e of res) {
+    fw += e.errNorm; if ((e.conf >= CONF_THR) === (e.tC >= 0.5)) cOk++;
+    cA += Math.abs(e.conf - e.tC); cSq += (e.conf - e.tC) ** 2;
+    const p = pc[e.cls]; p.n++; p.sumConf += e.conf; if ((e.conf >= CONF_THR) === (e.tC >= 0.5)) p.okConf++;
+    if (!e.blank) {
+      r.dist.n++; sN += e.errNorm; sqN += e.errNorm ** 2;
+      const er = Math.abs(e.real - e.trueReal); sR += er; sqR += er * er; p.sumReal += e.real; p.absR += er;
+    }
+  }
+  r.fwMae = fw / res.length; r.confAcc = cOk / res.length; r.conf.mae = cA / res.length; r.conf.rmse = Math.sqrt(cSq / res.length);
+  if (r.dist.n) { const k = r.dist.n; r.dist.maeN = sN / k; r.dist.rmseN = Math.sqrt(sqN / k); r.dist.maeR = sR / k; r.dist.rmseR = Math.sqrt(sqR / k); }
+  r.perClass = pc.map((p, i) => ({ cls: i, n: p.n, meanReal: i && p.n ? p.sumReal / p.n : null, maeR: i && p.n ? p.absR / p.n : null, meanConf: p.n ? p.sumConf / p.n : null, confAcc: p.n ? p.okConf / p.n : null }));
+  return r;
+}
+function setMetrics(model, samples, spec) {           // cheap version used once per epoch: firmware-style MAE and confidence accuracy
+  const B = makeBuf(model.L, model.F); let mae = 0, ok = 0;
+  for (const s of samples) { forward(model, s.input, B); const t = targetsOf(spec, s.cls); mae += Math.abs(B.dist - t.d); if ((B.conf >= CONF_THR) === (t.c >= 0.5)) ok++; }
+  return samples.length ? { mae: mae / samples.length, acc: ok / samples.length } : { mae: NaN, acc: NaN };
+}
+
+async function trainRun(model, train, val, spec, opts, hooks = {}) {
+  const L = model.L, B = makeBuf(L, model.F), G = makeGrad(L, model.F), O = makeOpt(model), rnd = mulberry32(opts.seed || 1234);
+  const total = train.length; if (!total) return { status: 'empty', epochs: 0, rollbacks: 0 };
+  const bpe = Math.ceil(total / opts.batch), idx = Array.from({ length: total }, (_, i) => i);
+  const mask = opts.dropout > 0 ? new Float32Array(L.flat) : null, tmp = opts.augBright > 0 || opts.augShift > 0 ? new Float32Array(L.IN * L.IN * 3) : null;
+  let lr = opts.lr, step = 1, rollbacks = 0, snap = snapshot(model, O), epoch = 1;
+  while (epoch <= opts.epochs) {
+    for (let i = total - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); const t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
+    let lossSum = 0, n = 0, mae = 0, ok = 0, bad = false;
+    for (let b = 0; b < bpe && !bad; b++) {
+      if (hooks.stop && hooks.stop()) return { status: 'stopped', epochs: epoch - 1, rollbacks };
+      while (hooks.paused && hooks.paused() && !(hooks.stop && hooks.stop())) await hooks.tick();
+      for (const k of PARAMS) G[k].fill(0);
+      let bl = 0;
+      const end = Math.min((b + 1) * opts.batch, total);
+      for (let i = b * opts.batch; i < end; i++) {
+        const s = train[idx[i]]; let inp = s.input;
+        if (tmp) { augment(s.input, tmp, L.IN, rnd, opts.augBright, opts.augShift); inp = tmp; }
+        if (mask) { const keep = 1 - opts.dropout; for (let q = 0; q < L.flat; q++) mask[q] = rnd() < keep ? 1 / keep : 0; }
+        forward(model, inp, B, mask);
+        const t = targetsOf(spec, s.cls); bl += sampleLoss(B, t.d, t.c);
+        mae += Math.abs(B.dist - t.d); if ((B.conf >= CONF_THR) === (t.c >= 0.5)) ok++; n++;
+        backward(model, inp, B, G, t.d, t.c, mask);
+      }
+      if (!isFinite(bl)) { bad = true; break; }
+      lossSum += bl;
+      for (const k of PARAMS) adam(model[k], G[k], O.m[k], O.v[k], step, lr);
+      step++;
+      if (hooks.tick) await hooks.tick();
+    }
+    if (bad || !isFinite(lossSum) || !modelFinite(model)) {     // roll back to the last good epoch, halve the learning rate
+      restore(model, O, snap); lr /= 2; rollbacks++;
+      if (hooks.log) hooks.log(`non-finite loss in epoch ${epoch}: rolled back, learning rate now ${lr.toExponential(2)} (${rollbacks}/5)`);
+      if (rollbacks > 5) return { status: 'diverged', epochs: epoch - 1, rollbacks };
+      continue;
+    }
+    snap = snapshot(model, O);
+    const v = setMetrics(model, val, spec);
+    if (hooks.onEpoch) hooks.onEpoch({ epoch, loss: lossSum / n, trainMae: mae / n, trainAcc: ok / n, valMae: v.mae, valAcc: v.acc, lr });
+    epoch++;
+  }
+  return { status: 'done', epochs: opts.epochs, rollbacks };
+}
+
+/* ---------- weights file: float32 little-endian, firmware order + calibration slope, offset ---------- */
+function serializeWeights(m) {
+  const L = m.L, buf = new ArrayBuffer(L.bytesCal), dv = new DataView(buf); let p = 0;
+  for (const k of PARAMS) for (let i = 0; i < m[k].length; i++) { dv.setFloat32(p, m[k][i], true); p += 4; }
+  dv.setFloat32(p, m.calib.slope, true); dv.setFloat32(p + 4, m.calib.offset, true);
+  return buf;
+}
+function parseWeights(buf, a) {                      // -> {ok, model, hasCalib, msg, fits}
+  const L = layoutOf(a), n = buf.byteLength;
+  if (n !== L.bytes && n !== L.bytesCal) {
+    const fits = layoutsFitting(n);
+    return { ok: false, fits, msg: `file is ${n} bytes; layout ${layoutText(L)} needs ${L.bytes} (or ${L.bytesCal} with calibration)` +
+      (fits.length ? `; it would fit ${fits.slice(0, 4).map(f => `${f.input}x${f.c1}x${f.c2}`).join(', ')}${fits.length > 4 ? ` and ${fits.length - 4} more` : ''}` : '; no known layout fits') };
+  }
+  const dv = new DataView(buf), m = newModel(a, 1); let p = 0;
+  for (const k of PARAMS) for (let i = 0; i < m[k].length; i++) { const v = dv.getFloat32(p, true); if (!isFinite(v)) return { ok: false, msg: 'file contains NaN or Infinity: refused' }; m[k][i] = v; p += 4; }
+  const hasCalib = n === L.bytesCal;
+  if (hasCalib) { const s = dv.getFloat32(p, true), o = dv.getFloat32(p + 4, true); if (!isFinite(s) || !isFinite(o)) return { ok: false, msg: 'calibration values are NaN or Infinity: refused' }; m.calib = { slope: s, offset: o, ready: true }; }
+  return { ok: true, model: m, hasCalib, msg: hasCalib ? 'weights and calibration loaded' : 'weights loaded, NO calibration in file' };
+}
+
+/* ---------- config.json ---------- */
+function makeConfig(spec, a, version) {
+  return JSON.stringify({ version, kind: 'vision-regression', input_size: a.input, conv1_filters: a.c1, conv2_filters: a.c2,
+    classes: spec.names, dist_labels: spec.dist.map(v => String(v)), dist_targets: spec.dist.map((v, i) => Math.round(targetNorm(spec, i) * 1e6) / 1e6), dist_max: spec.max, dist_unit: spec.unit }, null, 1);
+}
+function parseConfig(text) { try { const j = JSON.parse(text); return j && typeof j === 'object' ? j : null; } catch (e) { return null; } }
+function naturalCompare(a, b) { return a.localeCompare(b, 'en', { numeric: true, sensitivity: 'base' }); }
+function orderClasses(folders) {                      // blank first, then natural (numeric-aware) order
+  const isBlank = n => /^0?blank$/i.test(n) || /^0blank/i.test(n);
+  const blank = folders.filter(isBlank).sort(naturalCompare), rest = folders.filter(n => !isBlank(n)).sort(naturalCompare);
+  return { blank: blank[0] || null, rest, extraBlank: blank.slice(1) };
+}
+
+/* ---------- zip (STORE writer; STORE + DEFLATE reader) ---------- */
+const CRC_T = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(d) { let c = 0xFFFFFFFF; for (let i = 0; i < d.length; i++) c = CRC_T[(c ^ d[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+function zipWrite(entries) {                          // entries: [{name, data:Uint8Array|null}] ; name ending '/' = folder
+  const enc = new TextEncoder(), parts = [], cen = []; let off = 0;
+  const d = new Date(), dt = ((d.getFullYear() - 1980) << 9 | (d.getMonth() + 1) << 5 | d.getDate()) & 0xFFFF, tm = (d.getHours() << 11 | d.getMinutes() << 5 | (d.getSeconds() >> 1)) & 0xFFFF;
+  for (const e of entries) {
+    const nm = enc.encode(e.name), data = e.data || new Uint8Array(0), crc = crc32(data);
+    const lh = new DataView(new ArrayBuffer(30)); lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true); lh.setUint16(8, 0, true);
+    lh.setUint16(10, tm, true); lh.setUint16(12, dt, true); lh.setUint32(14, crc, true); lh.setUint32(18, data.length, true); lh.setUint32(22, data.length, true); lh.setUint16(26, nm.length, true); lh.setUint16(28, 0, true);
+    parts.push(new Uint8Array(lh.buffer), nm, data);
+    const ch = new DataView(new ArrayBuffer(46)); ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint16(8, 0x0800, true); ch.setUint16(10, 0, true);
+    ch.setUint16(12, tm, true); ch.setUint16(14, dt, true); ch.setUint32(16, crc, true); ch.setUint32(20, data.length, true); ch.setUint32(24, data.length, true); ch.setUint16(28, nm.length, true);
+    ch.setUint32(38, e.name.endsWith('/') ? 0x10 : 0, true); ch.setUint32(42, off, true);
+    cen.push(new Uint8Array(ch.buffer), nm);
+    off += 30 + nm.length + data.length;
+  }
+  let cs = 0; for (const c of cen) cs += c.length;
+  const end = new DataView(new ArrayBuffer(22)); end.setUint32(0, 0x06054b50, true); end.setUint16(8, entries.length, true); end.setUint16(10, entries.length, true); end.setUint32(12, cs, true); end.setUint32(16, off, true);
+  const all = [...parts, ...cen, new Uint8Array(end.buffer)]; let tot = 0; for (const a of all) tot += a.length;
+  const out = new Uint8Array(tot); let p = 0; for (const a of all) { out.set(a, p); p += a.length; }
+  return out;
+}
+async function inflateRaw(u8) {
+  const ds = new DecompressionStream('deflate-raw'), w = ds.writable.getWriter(); w.write(u8); w.close();
+  return new Uint8Array(await new Response(ds.readable).arrayBuffer());
+}
+async function zipRead(buf) {                         // -> [{name, data|null}] names normalised to forward slashes
+  const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf), dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  let e = -1; for (let i = u8.length - 22; i >= Math.max(0, u8.length - 65557); i--) if (dv.getUint32(i, true) === 0x06054b50) { e = i; break; }
+  if (e < 0) throw new Error('not a zip file (no end-of-central-directory)');
+  const cnt = dv.getUint16(e + 10, true); let p = dv.getUint32(e + 16, true); const dec = new TextDecoder(), out = [];
+  for (let k = 0; k < cnt; k++) {                     // sizes come from the central directory (data descriptors are fine)
+    if (dv.getUint32(p, true) !== 0x02014b50) throw new Error('bad central directory');
+    const method = dv.getUint16(p + 10, true), csz = dv.getUint32(p + 20, true), nl = dv.getUint16(p + 28, true), xl = dv.getUint16(p + 30, true), cl = dv.getUint16(p + 32, true), lho = dv.getUint32(p + 42, true);
+    const name = dec.decode(u8.subarray(p + 46, p + 46 + nl)).replace(/\\/g, '/');
+    p += 46 + nl + xl + cl;
+    if (name.endsWith('/')) { out.push({ name, data: null }); continue; }
+    const lnl = dv.getUint16(lho + 26, true), lxl = dv.getUint16(lho + 28, true), ds = lho + 30 + lnl + lxl, raw = u8.subarray(ds, ds + csz);
+    if (method === 0) out.push({ name, data: raw.slice() });
+    else if (method === 8) out.push({ name, data: await inflateRaw(raw) });
+    else throw new Error(`unsupported zip method ${method} for ${name}`);
+  }
+  return out;
+}
+function normalizeSdPaths(entries) {                  // tolerate a top-level folder and __MACOSX: cut everything before images/ or header/
+  const out = [];
+  for (const e of entries) {
+    if (/(^|\/)__MACOSX\//.test(e.name) || /(^|\/)\._/.test(e.name)) continue;
+    const parts = e.name.split('/'); const i = parts.findIndex(x => x === 'images' || x === 'header');
+    if (i < 0) { out.push({ name: e.name, data: e.data, other: true }); continue; }
+    out.push({ name: parts.slice(i).join('/'), data: e.data });
+  }
+  return out;
+}
+
+/* ---------- Web Serial frames ---------- */
+function b64ToBytes(s) { const bin = atob(s), u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; }
+const numList = s => s === '-' ? null : s.split(',').map(Number);
+function parseFrame(line) {                           // @F kind n pred probs logits layout input mapSide map payload  (11 fields)
+  const t = line.trim().split(' ');
+  if (t[0] !== '@F' || t.length !== 11) throw new Error(`bad frame: ${t.length} fields`);
+  return { kind: t[1], n: +t[2], pred: t[3] === '-' ? null : +t[3], probs: numList(t[4]), logits: numList(t[5]), layout: t[6], input: numList(t[7]),
+    mapSide: +t[8], map: t[9] === '-' ? null : b64ToBytes(t[9]), jpeg: b64ToBytes(t[10]) };
+}
+class FrameParser {
+  constructor() { this.held = ''; this.mid = false; }
+  push(chunk) {                                       // -> {text, frames, errors}; frames are never shown as text
+    let s = this.held + chunk, text = '', i = 0; const frames = [], errors = []; this.held = '';
+    while (i < s.length) {
+      const nl = s.indexOf('\n', i);
+      if (this.mid) { if (nl < 0) { text += s.slice(i); i = s.length; } else { text += s.slice(i, nl + 1); i = nl + 1; this.mid = false; } continue; }
+      if (s[i] === '@') {
+        if (nl < 0) { this.held = s.slice(i); if (this.held.length > 400000) this.held = ''; break; }
+        try { frames.push(parseFrame(s.slice(i, nl).replace(/\r$/, ''))); } catch (e) { errors.push(e.message); }
+        i = nl + 1;
+      } else if (nl < 0) { text += s.slice(i); this.mid = true; i = s.length; } else { text += s.slice(i, nl + 1); i = nl + 1; }
+    }
+    return { text, frames, errors };
+  }
+}
+function firmwareLine(model, spec, B, unit) {         // same text as the firmware's inference line
+  const real = realDist(model, spec, B.dist), det = B.conf >= CONF_THR;
+  let s = 'F1: 0FPS | ';
+  s += det ? `DIST=${real.toFixed(2)}${unit} (norm=${B.dist.toFixed(3)}) CONF=${(B.conf * 100).toFixed(0)}%` : `NoObject CONF=${(B.conf * 100).toFixed(0)}% (dist_raw=${B.dist.toFixed(3)})`;
+  if (det && B.dist > 1) s += ` [EXTRAPOLATED >${spec.max.toFixed(1)}${unit}]`;
+  return s;
+}
+/* ==CORE END== */
+
+/* ===== UI (needs the DOM; everything numeric lives in CORE above) ===== */
+const $ = id => document.getElementById(id);
+const VERSION = 'index-v002';
+const S = { spec: { names: ['0Blank'], dist: [], max: 10, unit: 'cm', autoMax: true }, samples: [], nextId: 1, lay: { input: 64, c1: 4, c2: 8 },
+  model: null, unsaved: false, dir: null, info: null, split: null, res: null, marks: new Set(), run: { on: false, paused: false, stop: false },
+  hist: [], stream: null, live: false, capN: 0, lastFrame: null };
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const curL = () => layoutOf(S.lay);
+const fmt = (v, d = 3) => (v === null || v === undefined || !isFinite(v)) ? '-' : (+v).toFixed(d);
+function log(msg) { const t = $('console'); t.value += `[${new Date().toLocaleTimeString()}] ${msg}\n`; t.scrollTop = t.scrollHeight; }
+const mc = new MessageChannel(); let tickRes = null; mc.port1.onmessage = () => { const r = tickRes; tickRes = null; if (r) r(); };
+const tick = () => new Promise(r => { tickRes = r; mc.port2.postMessage(0); });   // MessageChannel tick, not setTimeout (4 ms clamp)
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/* ---------- image decode (same path as the firmware: decode 240x240, nearest pixel resample) ---------- */
+async function jpegToRgb(bytes) {
+  const bmp = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }), { colorSpaceConversion: 'none', imageOrientation: 'none' });
+  const c = document.createElement('canvas'); c.width = 240; c.height = 240;
+  const x = c.getContext('2d', { willReadFrequently: true }); x.imageSmoothingEnabled = false; x.drawImage(bmp, 0, 0, 240, 240);
+  const d = x.getImageData(0, 0, 240, 240).data, rgb = new Uint8Array(240 * 240 * 3);
+  for (let i = 0, j = 0; i < d.length; i += 4) { rgb[j++] = d[i]; rgb[j++] = d[i + 1]; rgb[j++] = d[i + 2]; }
+  const sized = bmp.width === 240 && bmp.height === 240; if (bmp.close) bmp.close();
+  return { rgb, sized };
+}
+async function prepare(s) { const r = await jpegToRgb(s.bytes); s.input = resampleRgb(r.rgb, S.lay.input); s.inSize = S.lay.input; s.odd = !r.sized; }
+async function prepareAll() {
+  let n = 0, odd = 0;
+  for (const s of S.samples) {
+    if (!s.input || s.inSize !== S.lay.input) { try { await prepare(s); } catch (e) { s.input = null; log(`decode failed: ${s.path}`); } }
+    if (s.odd) odd++;
+    if (++n % 25 === 0) { $('trainStatus').textContent = `decoding ${n}/${S.samples.length}...`; await tick(); }
+  }
+  if (odd) log(`WARNING: ${odd} image(s) are not 240x240; the firmware assumes 240x240.`);
+  $('trainStatus').textContent = '';
+}
+const urlOf = s => s.url || (s.url = URL.createObjectURL(new Blob([s.bytes], { type: 'image/jpeg' })));
+const ready = () => S.model && S.model.L.IN === S.lay.input && S.model.L.C1 === S.lay.c1 && S.model.L.C2 === S.lay.c2;
+const usable = () => S.samples.filter(s => s.input && s.inSize === S.lay.input);
+
+/* ---------- SD access: File System Access API, zip fallback ---------- */
+const HAS_FS = 'showDirectoryPicker' in window;
+async function fsDir(parts, create) { let d = S.dir; for (const p of parts) d = await d.getDirectoryHandle(p, { create }); return d; }
+async function fsWrite(path, bytes) { const parts = path.split('/'), name = parts.pop(); const d = await fsDir(parts, true); const fh = await d.getFileHandle(name, { create: true }); const w = await fh.createWritable(); await w.write(bytes); await w.close(); }
+async function fsRemove(path) { const parts = path.split('/'), name = parts.pop(); const d = await fsDir(parts, false); await d.removeEntry(name); }
+async function fsRead(path) { try { const parts = path.split('/'), name = parts.pop(); const d = await fsDir(parts, false); return new Uint8Array(await (await (await d.getFileHandle(name)).getFile()).arrayBuffer()); } catch (e) { return null; } }
+async function readTree(h, prefix, out) {
+  for await (const [name, handle] of h.entries()) {
+    const p = prefix + name;
+    if (handle.kind === 'directory') { out.push({ name: p + '/', data: null }); await readTree(handle, p + '/', out); }
+    else if (/\.(jpg|JPG)$/.test(name) || p === 'header/myWeights.bin' || p === 'header/config.json') out.push({ name: p, data: new Uint8Array(await (await handle.getFile()).arrayBuffer()) });
+    else out.push({ name: p, data: new Uint8Array(0), skipped: true });
+  }
+}
+async function pickDir() {
+  if (!HAS_FS) { alert('Folder access needs desktop Chrome or Edge. Use "Load .zip" instead.'); return; }
+  try {
+    const h = await showDirectoryPicker({ mode: 'readwrite' }); const out = [];
+    for (const top of ['images', 'header']) { try { const d = await h.getDirectoryHandle(top); out.push({ name: top + '/', data: null }); await readTree(d, top + '/', out); } catch (e) { /* missing folder */ } }
+    S.dir = h; await ingest(out, 'SD folder "' + h.name + '"');
+  } catch (e) { if (e.name !== 'AbortError') log('Pick folder failed: ' + e.message); }
+}
+async function loadZip(file) {
+  try { const ents = normalizeSdPaths(await zipRead(await file.arrayBuffer())); S.dir = null; await ingest(ents.filter(e => !e.other), 'zip "' + file.name + '"'); }
+  catch (e) { log('Zip failed: ' + e.message); alert('Could not read zip: ' + e.message); }
+}
+function resetData() {
+  for (const s of S.samples) if (s.url) URL.revokeObjectURL(s.url);
+  S.samples = []; S.model = null; S.unsaved = false; S.split = null; S.res = null; S.marks.clear(); S.hist = []; S.info = null;
+}
+async function ingest(entries, source) {
+  resetData();
+  const folders = new Set(); let ignored = 0, wbin = null, cfg = null, cfgFound = false; const imgs = [];
+  for (const e of entries) {
+    const p = e.name.split('/');
+    if (p[0] === 'images') {
+      if (p[1]) folders.add(p[1]);
+      if (p.length === 3 && e.data && !e.skipped && p[2]) imgs.push({ cls: p[1], name: p[2], bytes: e.data });
+      else if (e.data && p[2]) ignored++;
+    } else if (e.name === 'header/myWeights.bin' && e.data) wbin = e.data;
+    else if (e.name === 'header/config.json' && e.data) { cfgFound = true; cfg = parseConfig(new TextDecoder().decode(e.data)); }
+    else if (e.data && !e.name.endsWith('/')) ignored++;
+  }
+  const notes = [];
+  let names, orderNote;
+  if (cfg && Array.isArray(cfg.classes) && cfg.classes.length >= 1) { names = cfg.classes.map(String); orderNote = 'class order from config.json'; }
+  else {
+    const o = orderClasses([...folders]); names = [o.blank || '0Blank', ...o.rest];
+    orderNote = 'no config.json: blank first, then folders in natural (numeric-aware) order. Keep numeric names or check the lines to paste.';
+    if (o.extraBlank.length) notes.push('extra blank-like folders treated as distance classes: ' + o.extraBlank.join(', '));
+  }
+  for (const f of folders) if (!names.includes(f)) { names.push(f); notes.push(`folder "${f}" is not in config.json; appended as the last class`); }
+  const dist = names.slice(1).map((n, i) => {
+    if (cfg && Array.isArray(cfg.dist_targets) && cfg.dist_targets.length === names.length - 1 && isFinite(cfg.dist_max)) return Math.round(cfg.dist_targets[i] * cfg.dist_max * 1e6) / 1e6;
+    return /^\d+(\.\d+)?$/.test(n) ? parseFloat(n) : NaN;
+  });
+  S.spec = { names, dist, max: cfg && isFinite(cfg.dist_max) && cfg.dist_max > 0 ? +cfg.dist_max : (Math.max(...dist.filter(isFinite), 0) || 10), unit: cfg && cfg.dist_unit ? String(cfg.dist_unit) : 'cm', autoMax: !(cfg && isFinite(cfg.dist_max)) };
+  if (cfg && [cfg.input_size, cfg.conv1_filters, cfg.conv2_filters].every(v => Number.isInteger(v))) {
+    const a = { input: cfg.input_size, c1: cfg.conv1_filters, c2: cfg.conv2_filters };
+    if (layoutOf(a).valid) S.lay = a; else notes.push('config.json layout is invalid; keeping the current layout');
+  }
+  for (const im of imgs) S.samples.push({ id: S.nextId++, cls: names.indexOf(im.cls), name: im.name, path: `/images/${im.cls}/${im.name}`, bytes: im.bytes });
+  let wmsg = 'no header/myWeights.bin';
+  if (wbin) {
+    let r = parseWeights(wbin.buffer.slice(wbin.byteOffset, wbin.byteOffset + wbin.byteLength), S.lay);
+    if (!r.ok && r.fits && r.fits.length === 1) { S.lay = r.fits[0]; notes.push(`weights fit exactly one layout, adopted ${layoutText(layoutOf(S.lay))}`); r = parseWeights(wbin.buffer.slice(wbin.byteOffset, wbin.byteOffset + wbin.byteLength), S.lay); }
+    wmsg = r.ok ? r.msg : 'REFUSED: ' + r.msg;
+    if (r.ok) { S.model = r.model; S.unsaved = false; if (!r.hasCalib) notes.push('LOUD WARNING: weights file has no calibration; distances use raw x max until you Refit calibration'); }
+  }
+  S.info = { source, classes: names.length, counts: names.map((_, i) => S.samples.filter(s => s.cls === i).length), wmsg, cfgFound, cfgOk: !!cfg, ignored, notes, orderNote };
+  log(`Loaded ${source}: ${S.samples.length} images, ${names.length} classes, ${ignored} other files ignored. ${orderNote}`);
+  for (const n of notes) log(n);
+  log('Weights: ' + wmsg);
+  syncLayoutInputs(); renderAll(); await prepareAll(); renderAll(); updateEval();
+}
+
+/* ---------- rendering ---------- */
+function renderAll() { renderSummary(); renderClasses(); renderSamples(); renderModelInfo(); renderSplit(); }
+function renderSummary() {
+  const i = S.info, el = $('summary');
+  if (!i) { el.textContent = 'Nothing loaded yet.'; return; }
+  el.innerHTML = `<b>${esc(i.source)}</b><br>${i.classes} classes, ${S.samples.length} images (${i.counts.map((c, k) => esc(S.spec.names[k]) + ': ' + c).join(', ')})<br>` +
+    `weights: ${esc(i.wmsg)}<br>config.json: ${i.cfgFound ? (i.cfgOk ? 'present' : 'present but unreadable') : 'not present'}<br>other files ignored: ${i.ignored}<br>` +
+    `<span class="dim">${esc(i.orderNote)}</span>` + i.notes.map(n => `<br><span class="warn">${esc(n)}</span>`).join('') +
+    (S.dir ? '<br><span class="dim">SD folder is open read/write: captures, deletes and moves change the card immediately (after confirmation).</span>' : '<br><span class="dim">Zip mode: nothing is written to a card; use Save .zip.</span>');
+}
+function refreshAutoMax() { if (S.spec.autoMax) { const f = S.spec.dist.filter(isFinite); if (f.length) S.spec.max = Math.max(...f); $('inMax').value = S.spec.max; } }
+function renderClasses() {
+  refreshAutoMax();
+  const sp = S.spec, rows = sp.names.map((n, i) => {
+    const list = S.samples.filter(s => s.cls === i), c = S.split ? S.split.per[i] : null;
+    const th = list.slice(0, 6).map(s => `<img class="th" data-open="${s.id}" src="${urlOf(s)}">`).join('');
+    const warn = c && c.train === 0 && list.length ? '<span class="warn"> no training samples left</span>' : '';
+    return `<tr><td>${i}</td><td><b>${esc(n)}</b>${i === 0 ? ' <span class="dim">(blank, target 0, confidence 0)</span>' : ''}</td>` +
+      `<td>${i === 0 ? '-' : `<input type="number" step="any" data-dist="${i - 1}" value="${isFinite(sp.dist[i - 1]) ? sp.dist[i - 1] : ''}" style="width:5em"> ${esc(sp.unit)}`}</td>` +
+      `<td>${i === 0 ? '0' : fmt(isFinite(sp.dist[i - 1]) ? targetNorm(sp, i - 1) : NaN, 4)}</td><td>${list.length}${c ? ` (train ${c.train} / val ${c.val})` : ''}${warn}</td><td>${th}</td>` +
+      `<td>${i === 0 ? '' : `<button data-rmcls="${i}" class="small">remove</button>`}</td></tr>`;
+  }).join('');
+  $('classTable').innerHTML = `<table><tr><th>#</th><th>folder</th><th>distance</th><th>target (norm)</th><th>images</th><th>samples</th><th></th></tr>${rows}</table>`;
+  $('inUnit').value = sp.unit; $('inMax').value = sp.max; $('chkAutoMax').checked = sp.autoMax;
+  const sel = $('selCapCls'), keep = sel.value; sel.innerHTML = sp.names.map((n, i) => `<option value="${i}">${i} ${esc(n)}</option>`).join(''); if (keep && keep < sp.names.length) sel.value = keep;
+  const rev = $('selRevCls'), k2 = rev.value; rev.innerHTML = sel.innerHTML; if (k2 && k2 < sp.names.length) rev.value = k2;
+  const f = v => { if (!Number.isFinite(v)) return 'NaNf'; let t = String(Math.round(v * 1e6) / 1e6); if (!/[.e]/.test(t)) t += '.0'; return t + 'f'; };
+  $('fwLines').value = `${layoutDefines(S.lay)}\n#define NUM_DIST_CLASSES ${sp.dist.length}\nconst float myDistTarget[NUM_DIST_CLASSES] = {${sp.dist.map((v, i) => f(Number.isFinite(v) ? targetNorm(sp, i) : NaN)).join(', ')}};\n` +
+    `String myDistLabel[NUM_DIST_CLASSES] = {${sp.dist.map(v => '"' + v + '"').join(', ')}};\nconst String myDistUnit = "${sp.unit}";\nconst float myDistMax = ${Number.isFinite(sp.max) ? sp.max.toFixed(1) : 'NaN'}f;\n` +
+    `String myClassLabels[TOTAL_CLASSES] = {${sp.names.map(n => '"' + n + '"').join(', ')}};`;
+}
+function renderSamples() {
+  const box = $('sampleBrowser'); box.innerHTML = '';
+  S.spec.names.forEach((n, i) => {
+    const list = S.samples.filter(s => s.cls === i), d = document.createElement('details');
+    d.innerHTML = `<summary>${i} ${esc(n)} (${list.length})</summary><div class="grid">${list.slice(0, 120).map(s => `<img class="th" data-open="${s.id}" title="${esc(s.name)}" src="${urlOf(s)}">`).join('')}</div>${list.length > 120 ? `<div class="dim">showing 120 of ${list.length}</div>` : ''}`;
+    box.appendChild(d);
+  });
+  $('selPar').innerHTML = S.samples.map(s => `<option value="${s.id}">${esc(s.path)}</option>`).join('');
+}
+function archText() {
+  const L = curL(); if (!L.valid) return 'invalid layout: ' + L.reason;
+  return `Input ${L.IN}x${L.IN}x3 -> Conv3x3 x${L.C1} + leaky ReLU (${L.o1}x${L.o1}) -> MaxPool2 (${L.p1}x${L.p1}) -> Conv3x3 x${L.C2} + leaky ReLU (${L.o2}x${L.o2}) -> Flatten ${L.flat} -> Dense 2 [distance linear, confidence sigmoid]`;
+}
+function renderModelInfo() {
+  const L = curL();
+  $('modelInfo').innerHTML = `${esc(archText())}<br>parameters: ${L.valid ? L.floats : '-'} | weights file: ${L.valid ? L.bytes + ' bytes (+8 calibration = ' + L.bytesCal + ')' : '-'}<br>` +
+    `model in memory: ${S.model ? (ready() ? 'yes' + (S.unsaved ? ' (UNSAVED)' : '') + ', calibration ' + (S.model.calib.ready ? `dist = ${fmt(S.model.calib.slope, 4)} * raw + ${fmt(S.model.calib.offset, 4)}` : '<span class="warn">MISSING (distance = raw x max)</span>') : '<span class="warn">layout differs from controls</span>') : 'none'}<br>` +
+    `weights file at load: ${S.info ? esc(S.info.wmsg) : '-'}`;
+  $('layoutMsg').innerHTML = L.valid ? `Valid. ${L.floats} weights = ${L.bytes} bytes. <span class="dim">Layout is COMPILE-TIME in the firmware: paste the #define lines (above) into the sketch and reflash.</span>` : `<span class="warn">Invalid: ${L.reason}</span>`;
+}
+function renderSplit() {
+  if (!S.split) { $('splitInfo').textContent = 'Validation split is computed when you train or update evaluation.'; return; }
+  const sp = S.split;
+  $('splitInfo').innerHTML = `train ${sp.train.length} / validation ${sp.val.length}: ` + S.spec.names.map((n, i) => `${esc(n)} ${sp.per[i].train}/${sp.per[i].val}`).join(', ') +
+    (sp.noTrain.length ? `<br><span class="warn">No training samples left for: ${sp.noTrain.map(i => esc(S.spec.names[i])).join(', ')} (the firmware rule holds out all of a class with N or fewer images).</span>` : '');
+}
+function computeSplit() { S.split = splitSamples(usable(), S.spec.names.length, $('selValMode').value, +$('inValN').value); renderSplit(); renderClasses(); return S.split; }
+
+/* ---------- data editing ---------- */
+function syncLayoutInputs() { $('inInput').value = S.lay.input; $('inC1').value = S.lay.c1; $('inC2').value = S.lay.c2; }
+async function onLayoutChange() {
+  const a = { input: +$('inInput').value, c1: +$('inC1').value, c2: +$('inC2').value }, L = layoutOf(a);
+  if (!L.valid) { $('layoutMsg').innerHTML = `<span class="warn">Invalid: ${L.reason}</span>`; return; }
+  if (a.input === S.lay.input && a.c1 === S.lay.c1 && a.c2 === S.lay.c2) return;
+  if (S.model && S.unsaved && !confirm('Changing the layout discards the trained model in memory, which is not saved. Continue?')) { syncLayoutInputs(); return; }
+  S.lay = a; S.model = null; S.unsaved = false; S.res = null; S.split = null; for (const s of S.samples) s.input = null;
+  log(`Layout changed to ${layoutText(L)}; model discarded, cached inputs invalidated (data on the card is untouched).`);
+  renderAll(); await prepareAll(); renderAll();
+}
+async function saveSample(clsIdx, bytes) {
+  const name = `img_w${Date.now()}_${String(S.capN++ % 100).padStart(2, '0')}.jpg`, cn = S.spec.names[clsIdx];
+  const s = { id: S.nextId++, cls: clsIdx, name, path: `/images/${cn}/${name}`, bytes, pending: !S.dir };
+  if (S.dir) await fsWrite(`images/${cn}/${name}`, bytes);
+  await prepare(s); S.samples.push(s); S.res = null; return s;
+}
+async function deleteSamples(list) {
+  for (const s of list) {
+    if (S.dir) { try { await fsRemove(s.path.slice(1)); } catch (e) { log(`could not delete ${s.path}: ${e.message}`); continue; } }
+    if (s.url) URL.revokeObjectURL(s.url);
+    const k = S.samples.indexOf(s); if (k >= 0) S.samples.splice(k, 1); S.marks.delete(s.id);
+  }
+  S.res = null; S.split = null; log(`Deleted ${list.length} image(s)${S.dir ? ' from the SD folder' : ' (in memory only)'}.`); renderAll();
+}
+async function moveSample(s, to) {
+  if (to === s.cls) return;
+  const cn = S.spec.names[to], np = `/images/${cn}/${s.name}`;
+  if (S.dir) { await fsWrite(np.slice(1), s.bytes); await fsRemove(s.path.slice(1)); }
+  s.cls = to; s.path = np; S.res = null; S.split = null; log(`Moved ${s.name} to ${cn}.`); renderAll();
+}
+async function addClass() {
+  const name = $('inNewName').value.trim(), v = parseFloat($('inNewVal').value);
+  if (!/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(name)) return alert('Folder name: letters, digits, _ . - only.');
+  if (S.spec.names.includes(name)) return alert('That class already exists.');
+  if (!isFinite(v)) return alert('Enter the distance value for this class.');
+  if (S.dir) await fsDir(['images', name], true);
+  S.spec.names.push(name); S.spec.dist.push(v); S.split = null; log(`Added class ${name} = ${v} ${S.spec.unit}. Paste the firmware lines and reflash.`); $('inNewName').value = ''; renderAll();
+}
+async function removeClass(i) {
+  const list = S.samples.filter(s => s.cls === i);
+  if (!confirm(`Remove class "${S.spec.names[i]}" and delete its ${list.length} image(s)${S.dir ? ' from the SD card' : ''}? This cannot be undone.`)) return;
+  if (S.dir) { try { await (await fsDir(['images'], false)).removeEntry(S.spec.names[i], { recursive: true }); } catch (e) { log('folder removal: ' + e.message); } }
+  for (const s of list) { if (s.url) URL.revokeObjectURL(s.url); S.samples.splice(S.samples.indexOf(s), 1); }
+  for (const s of S.samples) if (s.cls > i) s.cls--;
+  S.spec.names.splice(i, 1); S.spec.dist.splice(i - 1, 1); S.res = null; S.split = null; log(`Removed class index ${i}.`); renderAll();
+}
+
+/* ---------- heatmap (last conv layer) ---------- */
+function heatMap(model, input, mode) {
+  const L = model.L, B = makeBuf(L, model.F); forward(model, input, B);
+  const n = L.o2 * L.o2, map = new Float32Array(n);
+  for (let p = 0; p < n; p++) { let mx = -Infinity, sum = 0; for (let f = 0; f < L.C2; f++) { const v = B.c2o[f * n + p]; if (v > mx) mx = v; sum += v; } map[p] = mode === 'mean' ? sum / L.C2 : mx; }
+  return { map, side: L.o2, B };
+}
+function paintHeat(ctx, w, h, map, side, overlay) {
+  let mn = Infinity, mx = -Infinity; for (const v of map) { if (v < mn) mn = v; if (v > mx) mx = v; }
+  const c = document.createElement('canvas'); c.width = c.height = side; const x = c.getContext('2d'), id = x.createImageData(side, side);
+  for (let i = 0; i < map.length; i++) { const t = (map[i] - mn) / ((mx - mn) || 1); id.data[i * 4] = 255 * t; id.data[i * 4 + 1] = 200 * (1 - Math.abs(2 * t - 1)); id.data[i * 4 + 2] = 255 * (1 - t); id.data[i * 4 + 3] = 255; }
+  x.putImageData(id, 0, 0); ctx.save(); ctx.imageSmoothingEnabled = true; ctx.globalAlpha = overlay ? 0.5 : 1; ctx.drawImage(c, 0, 0, w, h); ctx.restore();
+}
+async function drawSample(cv, s) {
+  const ctx = cv.getContext('2d'), img = new Image(); img.src = urlOf(s); await img.decode().catch(() => { });
+  ctx.clearRect(0, 0, cv.width, cv.height); ctx.drawImage(img, 0, 0, cv.width, cv.height);
+  if (ready() && s.input && s.inSize === S.model.L.IN) { const h = heatMap(S.model, s.input, $('selHeatMode').value); paintHeat(ctx, cv.width, cv.height, h.map, h.side, $('chkOverlay').checked); }
+}
+function predictText(s) {
+  if (!ready() || !s.input || s.inSize !== S.model.L.IN) return 'no model';
+  const B = makeBuf(S.model.L, S.model.F); forward(S.model, s.input, B);
+  const t = targetsOf(S.spec, s.cls), real = realDist(S.model, S.spec, B.dist);
+  return `true ${s.cls === 0 ? 'blank' : fmt(t.d * S.spec.max, 2) + S.spec.unit} | predicted ${fmt(real, 2)}${S.spec.unit} (norm ${fmt(B.dist, 3)}), confidence ${fmt(B.conf * 100, 0)}%`;
+}
+
+/* ---------- inspector ---------- */
+let inspS = null;
+async function openInspector(id) {
+  const s = S.samples.find(x => x.id === id); if (!s) return; inspS = s;
+  $('insp').classList.add('open'); $('inspInfo').innerHTML = `${esc(s.path)}<br>class ${esc(S.spec.names[s.cls])}<br>${esc(predictText(s))}`;
+  $('selInspMove').innerHTML = S.spec.names.map((n, i) => `<option value="${i}">${i} ${esc(n)}</option>`).join(''); $('selInspMove').value = s.cls;
+  await drawSample($('cvInsp'), s);
+}
+const closeInspector = () => { $('insp').classList.remove('open'); inspS = null; };
+
+/* ---------- review mode ---------- */
+const R = { list: [], i: 0 };
+function openReview() {
+  const ci = +$('selRevCls').value; let list = S.samples.filter(s => s.cls === ci);
+  if ($('chkSusp').checked && ready()) { const ev = evaluate(S.model, list.filter(s => s.input), S.spec); list = ev.sort((a, b) => b.score - a.score).map(e => e.s); }
+  else list.sort((a, b) => cmpPath(a.path, b.path));
+  R.list = list; R.i = 0; $('rev').classList.add('open'); showReview();
+}
+function showReview() {
+  const s = R.list[R.i], marked = [...S.marks].length;
+  $('btnRevDel').textContent = `Delete marked (${marked})`;
+  if (!s) { $('revImg').removeAttribute('src'); $('revInfo').textContent = 'No images in this class.'; $('revPos').textContent = '0/0'; return; }
+  $('revImg').src = urlOf(s); $('revPos').textContent = `${R.i + 1}/${R.list.length}`;
+  $('revInfo').innerHTML = `${esc(s.name)} ${S.marks.has(s.id) ? '<b class="warn">MARKED BAD</b>' : ''}<br>${esc(predictText(s))}`;
+}
+const revStep = d => { if (R.list.length) { R.i = (R.i + d + R.list.length) % R.list.length; showReview(); } };
+function revMark(adv) { const s = R.list[R.i]; if (!s) return; if (adv) S.marks.add(s.id); else if (S.marks.has(s.id)) S.marks.delete(s.id); else S.marks.add(s.id); if (adv) revStep(1); else showReview(); }
+async function revDelete() {
+  const list = S.samples.filter(s => S.marks.has(s.id)); if (!list.length) return;
+  const per = S.spec.names.map((n, i) => [n, list.filter(s => s.cls === i).length]).filter(x => x[1]);
+  if (!confirm(`Delete ${list.length} marked image(s)${S.dir ? ' from the SD card' : ''}?\n` + per.map(x => `${x[0]}: ${x[1]}`).join('\n'))) return;
+  await deleteSamples(list); openReview();
+}
+
+/* ---------- training ---------- */
+function drawLines(cv, series, title) {
+  const x = cv.getContext('2d'), W = cv.width, H = cv.height; x.clearRect(0, 0, W, H); x.fillStyle = '#bbb'; x.font = '11px system-ui'; x.fillText(title, 6, 12);
+  let mx = 0, n = 0; for (const s of series) for (const v of s.data) if (isFinite(v)) { mx = Math.max(mx, v); n = Math.max(n, s.data.length); } if (!n) return; mx = mx || 1;
+  x.strokeStyle = '#444'; x.strokeRect(30, 18, W - 36, H - 30); x.fillText(mx.toPrecision(2), 2, 28); x.fillText('0', 18, H - 12);
+  series.forEach((s, k) => { x.strokeStyle = s.color; x.beginPath(); s.data.forEach((v, i) => { if (!isFinite(v)) return; const px = 30 + (W - 36) * (n === 1 ? 0.5 : i / (n - 1)), py = H - 12 - (H - 30) * v / mx; i ? x.lineTo(px, py) : x.moveTo(px, py); }); x.stroke(); x.fillStyle = s.color; x.fillText(s.label, W - 90, 14 + k * 11); });
+}
+function drawCharts() {
+  const h = S.hist;
+  drawLines($('cvLoss'), [{ label: 'train loss', color: '#6cf', data: h.map(e => e.loss) }], 'loss per epoch');
+  drawLines($('cvMae'), [{ label: 'train MAE', color: '#6cf', data: h.map(e => e.trainMae) }, { label: 'val MAE', color: '#fa5', data: h.map(e => e.valMae) }], 'distance MAE (normalized, blank target 0)');
+  drawLines($('cvAcc'), [{ label: 'train conf acc', color: '#6cf', data: h.map(e => e.trainAcc) }, { label: 'val conf acc', color: '#fa5', data: h.map(e => e.valAcc) }], 'confidence accuracy (threshold 0.5)');
+}
+async function doTrain() {
+  if (S.run.on) return;
+  const L = curL(); if (!L.valid) return alert('Invalid layout: ' + L.reason);
+  const err = specValid(S.spec); if (err) return alert(err);
+  if (!S.samples.length) return alert('Load an SD folder or zip with images first.');
+  await prepareAll(); const sp = computeSplit();
+  if (sp.noTrain.length) log('WARNING: no training samples left for: ' + sp.noTrain.map(i => S.spec.names[i]).join(', '));
+  if (!sp.train.length) return alert('No training samples.');
+  if (!(ready() && $('chkContinue').checked)) { S.model = newModel(S.lay, (Date.now() & 0xffff) || 1); }
+  const opts = { lr: +$('inLR').value, batch: Math.max(1, +$('inBatch').value | 0), epochs: Math.max(1, +$('inEpochs').value | 0), dropout: Math.min(0.9, Math.max(0, +$('inDrop').value)), augBright: Math.max(0, +$('inAugB').value), augShift: Math.max(0, +$('inAugS').value | 0), seed: Date.now() & 0xffff };
+  S.run = { on: true, paused: false, stop: false }; S.hist = []; $('btnPause').textContent = 'Pause';
+  $('btnTrain').disabled = true; $('btnPause').disabled = false; $('btnStop').disabled = false;
+  log(`Training ${layoutText(L)}: ${sp.train.length} train / ${sp.val.length} val, lr ${opts.lr}, batch ${opts.batch}, ${opts.epochs} epochs, Adam state starts fresh.`);
+  const model = S.model;
+  const res = await trainRun(model, sp.train, sp.val, S.spec, opts, {
+    tick, stop: () => S.run.stop, paused: () => S.run.paused, log,
+    onEpoch: e => { S.hist.push(e); $('trainStatus').textContent = `epoch ${e.epoch}/${opts.epochs}  loss ${fmt(e.loss, 4)}  train MAE ${fmt(e.trainMae, 4)}  val MAE ${fmt(e.valMae, 4)}  conf acc ${fmt(e.trainAcc * 100, 0)}%/${fmt(e.valAcc * 100, 0)}%  lr ${e.lr.toExponential(1)}`; drawCharts(); }
+  });
+  S.run.on = false; $('btnTrain').disabled = false; $('btnPause').disabled = true; $('btnStop').disabled = true;
+  if (res.status === 'empty') return;
+  if (res.status === 'diverged') log('Training diverged after 5 rollbacks; the model in memory is the last good epoch. Lower the learning rate.');
+  if (modelFinite(model)) {
+    const an = calibrateModel(model, sp.train, S.spec);
+    for (const a of an) log(`  calibration anchor ${S.spec.names[a.cls]}: mean raw ${fmt(a.raw, 4)} -> ${fmt(a.real, 2)}${S.spec.unit}`);
+    log(`Calibration (as the firmware): dist = ${fmt(model.calib.slope, 4)} * raw + ${fmt(model.calib.offset, 4)}`);
+  }
+  S.unsaved = true; log(`Training ${res.status} after ${res.epochs} epoch(s), ${res.rollbacks} rollback(s). Model is in memory and NOT saved.`);
+  renderAll(); updateEval();
+}
+function refitCalib() {
+  if (!ready()) return alert('No model in memory for the current layout.'); if (specValid(S.spec)) return alert(specValid(S.spec));
+  const sp = S.split || computeSplit(); const an = calibrateModel(S.model, sp.train, S.spec); S.unsaved = true;
+  log('Calibration refitted on the training split: ' + an.map(a => `${S.spec.names[a.cls]} ${fmt(a.raw, 3)}->${fmt(a.real, 1)}`).join(', ') + `; dist = ${fmt(S.model.calib.slope, 4)} * raw + ${fmt(S.model.calib.offset, 4)}`);
+  renderModelInfo(); updateEval();
+}
+
+/* ---------- analysis ---------- */
+function updateEval() {
+  const box = $('metrics');
+  if (!ready()) { box.textContent = 'Train or load a model (matching the layout) to see metrics.'; $('classStats').innerHTML = ''; $('gallery').innerHTML = ''; $('warnings').innerHTML = ''; clearScatter(); return; }
+  if (specValid(S.spec)) { box.innerHTML = `<span class="warn">${esc(specValid(S.spec))}</span>`; return; }
+  const sp = S.split || computeSplit(), set = $('selEval').value === 'val' ? sp.val : usable();
+  if (!set.length) { box.textContent = 'The evaluation set is empty (try "all samples").'; return; }
+  S.res = evaluate(S.model, set, S.spec); const m = summarize(S.res, S.spec), u = S.spec.unit;
+  box.innerHTML = `<table><tr><th>output</th><th>MAE</th><th>RMSE</th><th>n</th></tr>` +
+    `<tr><td>distance, real units (object samples, calibrated)</td><td>${fmt(m.dist.maeR, 3)} ${u}</td><td>${fmt(m.dist.rmseR, 3)} ${u}</td><td>${m.dist.n}</td></tr>` +
+    `<tr><td>distance, normalized (object samples)</td><td>${fmt(m.dist.maeN, 4)}</td><td>${fmt(m.dist.rmseN, 4)}</td><td>${m.dist.n}</td></tr>` +
+    `<tr><td>confidence vs target 0/1 (all samples)</td><td>${fmt(m.conf.mae, 4)}</td><td>${fmt(m.conf.rmse, 4)}</td><td>${m.n}</td></tr></table>` +
+    `firmware-style validation MAE (all samples, blank target 0): <b>${fmt(m.fwMae, 4)}</b> | confidence accuracy at 0.5: <b>${fmt(m.confAcc * 100, 1)}%</b>`;
+  const counts = S.spec.names.map((_, i) => S.samples.filter(s => s.cls === i).length), w = [];
+  const pos = counts.filter(c => c > 0);
+  if (pos.length && Math.max(...pos) > 3 * Math.min(...pos)) w.push('Class imbalance: the largest class has more than 3x the samples of the smallest.');
+  counts.forEach((c, i) => { if (c < 10) w.push(`Class "${S.spec.names[i]}" has only ${c} sample(s) (under 10).`); });
+  if (!S.model.calib.ready) w.push('Calibration is missing: distances are raw x max. Use "Refit calibration".');
+  w.push('Near-duplicate burst samples inflate validation accuracy. Browser files (img_w...) and device files (img_<millis>) sort differently, so "last N by name" may hold out one source only.');
+  $('warnings').innerHTML = w.map(x => `<div class="warn">${esc(x)}</div>`).join('');
+  $('classStats').innerHTML = `<table><tr><th>class</th><th>samples (card)</th><th>evaluated</th><th>mean predicted</th><th>MAE</th><th>mean conf</th><th>conf acc</th></tr>` +
+    m.perClass.map(p => `<tr><td>${esc(S.spec.names[p.cls])}</td><td>${counts[p.cls]}</td><td>${p.n}</td><td>${p.meanReal === null ? '-' : fmt(p.meanReal, 2) + u}</td><td>${p.maeR === null ? '-' : fmt(p.maeR, 2) + u}</td><td>${fmt(p.meanConf, 3)}</td><td>${p.confAcc === null ? '-' : fmt(p.confAcc * 100, 0) + '%'}</td></tr>`).join('') + '</table>';
+  drawScatter(S.res);
+  const worst = [...S.res].sort((a, b) => b.score - a.score).slice(0, 24);
+  $('gallery').innerHTML = worst.map(e => `<div class="gi" data-open="${e.s.id}"><img src="${urlOf(e.s)}"><span>${esc(S.spec.names[e.cls])}<br>${e.blank ? 'conf ' + fmt(e.conf, 2) : fmt(e.real, 1) + ' vs ' + fmt(e.trueReal, 1)}</span></div>`).join('');
+}
+function clearScatter() { const c = $('cvScatter'); c.getContext('2d').clearRect(0, 0, c.width, c.height); }
+function drawScatter(res) {
+  const cv = $('cvScatter'), x = cv.getContext('2d'), W = cv.width, H = cv.height, mx = S.spec.max * 1.25; x.clearRect(0, 0, W, H);
+  x.strokeStyle = '#444'; x.strokeRect(34, 10, W - 44, H - 34); x.fillStyle = '#bbb'; x.font = '11px system-ui';
+  x.fillText('true (' + S.spec.unit + ')', W / 2 - 20, H - 4); x.save(); x.translate(10, H / 2 + 30); x.rotate(-Math.PI / 2); x.fillText('predicted', 0, 0); x.restore();
+  const X = v => 34 + (W - 44) * v / mx, Y = v => H - 24 - (H - 34) * Math.max(0, Math.min(mx, v)) / mx;
+  x.strokeStyle = '#6a6'; x.beginPath(); x.moveTo(X(0), Y(0)); x.lineTo(X(mx), Y(mx)); x.stroke();
+  const cols = ['#888', '#6cf', '#fa5', '#9e6', '#f7c', '#cf6'], r = mulberry32(1);
+  for (const e of res) if (!e.blank) { x.fillStyle = cols[e.cls % cols.length]; x.beginPath(); x.arc(X(e.trueReal) + (r() - 0.5) * 8, Y(e.real), 3, 0, 7); x.fill(); }
+}
+function parityTest() {
+  const s = S.samples.find(x => x.id === +$('selPar').value); if (!s) return log('Parity: choose a sample.');
+  if (!ready() || !s.input) return log('Parity: no model in memory for the current layout.');
+  const B = makeBuf(S.model.L, S.model.F); forward(S.model, s.input, B); const L = S.model.L, c = ((L.IN >> 1) * L.IN + (L.IN >> 1)) * 3;
+  log(`PARITY ${s.path}\n  layout ${layoutText(L)}  input centre px ${[0, 1, 2].map(k => s.input[c + k].toFixed(4)).join(',')}\n  raw0 ${B.raw0.toFixed(4)} raw1 ${B.raw1.toFixed(4)} | dist ${B.dist.toFixed(4)} conf ${B.conf.toFixed(4)}\n  ${firmwareLine(S.model, S.spec, B, S.spec.unit)}`);
+}
+
+/* ---------- camera ---------- */
+function frameCanvas(v) {
+  const c = document.createElement('canvas'); c.width = c.height = 240; const x = c.getContext('2d', { willReadFrequently: true });
+  const w = v.videoWidth, h = v.videoHeight, s = Math.min(w, h);
+  x.save(); const b = +$('inBright').value || 1; x.filter = `brightness(${b})`;
+  if ($('chkMirror').checked) { x.translate(240, 0); x.scale(-1, 1); } if ($('chkVflip').checked) { x.translate(0, 240); x.scale(1, -1); }
+  x.drawImage(v, (w - s) / 2, (h - s) / 2, s, s, 0, 0, 240, 240); x.restore(); return c;
+}
+async function roundTrip(canvas) {                       // encode to JPEG and decode again, like a stored image
+  const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.85)), bytes = new Uint8Array(await blob.arrayBuffer());
+  return { bytes, rgb: (await jpegToRgb(bytes)).rgb };
+}
+async function toggleCam() {
+  if (S.stream) { S.stream.getTracks().forEach(t => t.stop()); S.stream = null; $('vid').srcObject = null; $('vid2').srcObject = null; $('btnCam').textContent = 'Start camera'; return; }
+  try { S.stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false }); $('vid').srcObject = S.stream; $('vid2').srcObject = S.stream; $('btnCam').textContent = 'Stop camera'; }
+  catch (e) { log('Camera failed: ' + e.message); alert('Camera failed: ' + e.message); }
+}
+function mirrorPreview() { const t = `${$('chkMirror').checked ? 'scaleX(-1) ' : ''}${$('chkVflip').checked ? 'scaleY(-1)' : ''}`; $('vid').style.transform = t; $('vid2').style.transform = t; }
+function waitFrame(v) {
+  return new Promise(res => { let done = false; const t = setTimeout(() => { if (!done) { done = true; res(); } }, 250);
+    if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(() => { if (!done) { done = true; clearTimeout(t); res(); } }); else setTimeout(() => { if (!done) { done = true; clearTimeout(t); res(); } }, 50); });
+}
+async function flash() { const f = $('flash'); f.style.opacity = 0.7; await sleep(60); f.style.opacity = 0; }
+async function captureOne() {
+  if (!S.stream) return alert('Start the camera first.');
+  const ci = +$('selCapCls').value, rt = await roundTrip(frameCanvas($('vid'))); flash();
+  await saveSample(ci, rt.bytes); log(`Captured into ${S.spec.names[ci]}${S.dir ? '' : ' (memory only: use Save .zip)'}.`); renderAll();
+}
+let bursting = false;
+async function burst() {
+  if (!S.stream || bursting) return; bursting = true; const ci = +$('selCapCls').value, delay = Math.max(0, +$('inDelay').value || 0), frames = [], b = $('btnBurst');
+  b.classList.add('rec'); $('recBadge').style.display = 'block';
+  for (let i = 0; i < 10; i++) { await waitFrame($('vid')); frames.push(frameCanvas($('vid'))); b.textContent = `REC ${i + 1}/10`; flash(); if (delay) await sleep(delay); }
+  b.textContent = 'saving...'; 
+  for (const cv of frames) { const rt = await roundTrip(cv); await saveSample(ci, rt.bytes); }
+  b.classList.remove('rec'); b.textContent = 'Burst 10 (B)'; $('recBadge').style.display = 'none'; bursting = false;
+  log(`Burst of 10 saved into ${S.spec.names[ci]}. Burst samples are near-duplicates: they inflate validation accuracy.`); renderAll();
+}
+async function toggleLive() {
+  if (S.live) { S.live = false; $('btnLive').textContent = 'Start live inference'; return; }
+  if (!S.stream) return alert('Start the camera first.'); S.live = true; $('btnLive').textContent = 'Stop live inference';
+  const B = () => makeBuf(S.model.L, S.model.F);
+  while (S.live) {
+    if (!ready()) { $('liveBanner').textContent = 'No model in memory for this layout.'; await sleep(300); continue; }
+    const v = $('vid2'); if (v.readyState < 2) { await sleep(100); continue; }
+    const cv = frameCanvas(v), rt = await roundTrip(cv), inp = resampleRgb(rt.rgb, S.model.L.IN), b = B(); forward(S.model, inp, b);
+    const real = realDist(S.model, S.spec, b.dist), det = b.conf >= CONF_THR, u = S.spec.unit;
+    $('liveBanner').innerHTML = det ? `<b>${fmt(real, 2)} ${u}</b> <span class="dim">confidence ${fmt(b.conf * 100, 0)}%</span>${b.dist > 1 ? ' <span class="warn">extrapolated beyond max</span>' : ''}` : `<b>No object</b> <span class="dim">confidence ${fmt(b.conf * 100, 0)}% (distance raw ${fmt(b.dist, 3)})</span>`;
+    $('liveBars').innerHTML = `<div class="bar"><div style="width:${Math.min(100, b.conf * 100)}%"></div></div><span class="dim">confidence</span><div class="bar"><div style="width:${Math.max(0, Math.min(100, real / (S.spec.max * 1.25) * 100))}%;background:#fa5"></div></div><span class="dim">distance (full bar = 1.25 x max)</span>`;
+    const lc = $('cvLive'), x = lc.getContext('2d'); x.drawImage(cv, 0, 0, lc.width, lc.height);
+    const h = heatMap(S.model, inp, $('selHeatMode').value); paintHeat(x, lc.width, lc.height, h.map, h.side, $('chkOverlay').checked);
+    await sleep(120);
+  }
+}
+
+/* ---------- save ---------- */
+function download(name, u8) { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([u8])); a.download = name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 10000); }
+const cfgBytes = () => new TextEncoder().encode(makeConfig(S.spec, S.lay, VERSION));
+function saveOk() {
+  if (!ready()) { alert('No model in memory for the current layout.'); return false; }
+  if (!modelFinite(S.model)) { alert('The model contains NaN or Infinity and will not be saved.'); return false; }
+  const e = specValid(S.spec); if (e) { alert(e); return false; }
+  if (!S.model.calib.ready && !confirm('This model has NO calibration. The device will report distance = raw x max. Save anyway?')) return false;
+  return true;
+}
+async function saveWeights() {
+  if (!saveOk()) return; const w = new Uint8Array(serializeWeights(S.model));
+  if (S.dir) {
+    const old = await fsRead('header/myWeights.bin'); if (old) { await fsWrite('header/myWeights.bin.bak', old); log('Existing weights copied to header/myWeights.bin.bak'); }
+    await fsWrite('header/myWeights.bin', w); await fsWrite('header/config.json', cfgBytes()); S.unsaved = false;
+    $('saveMsg').textContent = `Saved header/myWeights.bin (${w.length} bytes) and header/config.json. Put the card back in the board.`; log($('saveMsg').textContent);
+  } else { download('myWeights.bin', w); download('config.json', cfgBytes()); S.unsaved = false; $('saveMsg').textContent = 'Downloaded myWeights.bin and config.json: copy both into the card\'s header/ folder.'; log($('saveMsg').textContent); }
+  renderModelInfo();
+}
+async function saveConfig() {
+  const e = specValid(S.spec); if (e) return alert(e);
+  if (S.dir) { await fsWrite('header/config.json', cfgBytes()); $('saveMsg').textContent = 'Wrote header/config.json.'; } else { download('config.json', cfgBytes()); $('saveMsg').textContent = 'Downloaded config.json.'; }
+  log($('saveMsg').textContent);
+}
+async function saveZip() {
+  const ents = [{ name: 'images/', data: null }, ...S.spec.names.map(n => ({ name: `images/${n}/`, data: null })), { name: 'header/', data: null }];
+  if (ready() && modelFinite(S.model)) { ents.push({ name: 'header/myWeights.bin', data: new Uint8Array(serializeWeights(S.model)) }); if (!S.model.calib.ready) log('WARNING: zip weights have no calibration.'); }
+  if (!specValid(S.spec)) ents.push({ name: 'header/config.json', data: cfgBytes() });
+  if ($('chkImgs').checked) for (const s of S.samples) ents.push({ name: s.path.slice(1), data: s.bytes });
+  download('sdcard.zip', zipWrite(ents)); if (ready()) S.unsaved = false; $('saveMsg').textContent = `Downloaded sdcard.zip (${ents.length} entries${$('chkImgs').checked ? '' : ', without images'}).`; log($('saveMsg').textContent); renderModelInfo();
+}
+
+/* ---------- Web Serial monitor and device view ---------- */
+let port = null, writer = null, readDone = null, hb = null, sparser = new FrameParser(), readerObj = null;
+const ser = t => { const o = $('serOut'); o.value += t; if (o.value.length > 120000) o.value = o.value.slice(-80000); o.scrollTop = o.scrollHeight; };
+async function serSend(t) { if (!writer) return; await writer.write(new TextEncoder().encode(t)); }
+function hbStart() { hbStop(); serSend('D').catch(() => { }); hb = setInterval(() => serSend('D').catch(() => { }), 5000); }
+function hbStop() { if (hb) { clearInterval(hb); hb = null; } }
+async function serConnect() {
+  if (!('serial' in navigator)) return alert('Web Serial needs desktop Chrome or Edge.');
+  try {
+    port = await navigator.serial.requestPort(); await port.open({ baudRate: 115200 }); writer = port.writable.getWriter(); sparser = new FrameParser();
+    $('btnSerConn').disabled = true; $('btnSerDisc').disabled = false; ser('--- connected at 115200 ---\n'); if ($('chkDbg').checked) hbStart();
+    readDone = (async () => {
+      readerObj = port.readable.getReader(); const dec = new TextDecoder();
+      try { for (;;) { const { value, done } = await readerObj.read(); if (done) break; const r = sparser.push(dec.decode(value, { stream: true })); if (r.text) ser(r.text); r.errors.forEach(e => log('serial frame dropped: ' + e)); for (const f of r.frames) { S.lastFrame = f; showDevice(f).catch(e => log('device view: ' + e.message)); } } }
+      catch (e) { ser(`\n--- read error: ${e.message} ---\n`); } finally { readerObj.releaseLock(); }
+    })();
+  } catch (e) { if (e.name !== 'NotFoundError') log('Serial connect failed: ' + e.message); }
+}
+async function serDisconnect() {
+  hbStop(); try { await serSend('d'); } catch (e) { }
+  try { if (readerObj) await readerObj.cancel(); } catch (e) { } try { await readDone; } catch (e) { }
+  try { writer.releaseLock(); } catch (e) { } try { await port.close(); } catch (e) { }
+  port = null; writer = null; $('btnSerConn').disabled = false; $('btnSerDisc').disabled = true; ser('--- disconnected ---\n');
+}
+let devUrl = null, devBusy = false;
+async function showDevice(f) {
+  if (devBusy) return; devBusy = true;
+  try {
+    if (devUrl) URL.revokeObjectURL(devUrl); devUrl = URL.createObjectURL(new Blob([f.jpeg], { type: 'image/jpeg' })); $('devImg').src = devUrl;
+    const mc2 = $('cvDevMap'), x = mc2.getContext('2d'); x.clearRect(0, 0, mc2.width, mc2.height);
+    if (f.map && f.mapSide * f.mapSide === f.map.length) { const m = Float32Array.from(f.map); paintHeat(x, mc2.width, mc2.height, m, f.mapSide, false); }
+    let t = `frame ${f.kind}#${f.n} layout ${f.layout}<br>`;
+    if (f.probs) {
+      t += `device: distance ${fmt(f.pred, 3)} ${esc(S.spec.unit)} (norm ${fmt(f.probs[0], 4)}), confidence ${fmt(f.probs[1], 4)}, raw ${f.logits.map(v => fmt(v, 4)).join(', ')}<br>`;
+      if (ready() && f.layout === layoutText(S.model.L)) {
+        const inp = resampleRgb((await jpegToRgb(f.jpeg)).rgb, S.model.L.IN), B = makeBuf(S.model.L, S.model.F); forward(S.model, inp, B);
+        const L = S.model.L, c = ((L.IN >> 1) * L.IN + (L.IN >> 1)) * 3, inDiff = Math.max(...[0, 1, 2].map(k => Math.abs(inp[c + k] - f.input[k])));
+        const outDiff = Math.max(Math.abs(B.dist - f.probs[0]), Math.abs(B.conf - f.probs[1])), real = realDist(S.model, S.spec, B.dist);
+        t += `page:   distance ${fmt(real, 3)} ${esc(S.spec.unit)} (norm ${fmt(B.dist, 4)}), confidence ${fmt(B.conf, 4)}<br>largest output difference ${fmt(outDiff, 4)}; centre-pixel input difference ${fmt(inDiff, 4)}<br>`;
+        t += inDiff > 0.02 ? '<b class="warn">INPUTS differ: preprocessing/decode differs (camera settings, JPEG decoder, resize).</b>' : (outDiff > 0.02 ? '<b class="warn">Inputs match but OUTPUTS differ: the device weights differ from the model in the page.</b>' : '<b class="ok">Match: same input, same answer.</b>');
+      } else t += '<span class="dim">Load or train a model with the same layout to compare.</span>';
+    } else t += '<span class="dim">no model on the device yet: image only</span>';
+    $('devTxt').innerHTML = t;
+  } finally { devBusy = false; }
+}
+
+/* ---------- wiring ---------- */
+document.addEventListener('click', e => {
+  const o = e.target.closest('[data-open]'); if (o) openInspector(+o.dataset.open);
+  const r = e.target.closest('[data-rmcls]'); if (r) removeClass(+r.dataset.rmcls);
+});
+document.addEventListener('change', e => {
+  const d = e.target.dataset && e.target.dataset.dist; if (d !== undefined) { S.spec.dist[+d] = e.target.value === '' ? NaN : parseFloat(e.target.value); log('Distance values changed: paste the firmware lines and refit calibration.'); renderClasses(); }
+});
+document.addEventListener('keydown', e => {
+  const tag = (e.target.tagName || '').toLowerCase(), typing = tag === 'input' || tag === 'textarea' || tag === 'select';
+  if ($('rev').classList.contains('open')) {
+    if (e.key === 'ArrowRight') { revStep(1); e.preventDefault(); } else if (e.key === 'ArrowLeft') { revStep(-1); e.preventDefault(); }
+    else if (e.key === 'x' || e.key === 'X') { revMark(true); e.preventDefault(); } else if (e.key === 'Escape') $('rev').classList.remove('open'); return;
+  }
+  if ($('insp').classList.contains('open')) { if (e.key === 'Escape') closeInspector(); return; }
+  if (typing) return;
+  if (e.code === 'Space') { e.preventDefault(); captureOne().catch(err => log(err.message)); } else if (e.key === 'b' || e.key === 'B') burst().catch(err => log(err.message));
+});
+window.addEventListener('beforeunload', e => { if (S.unsaved) { e.preventDefault(); e.returnValue = ''; } });
+function init() {
+  $('btnPickDir').onclick = pickDir; $('fileZip').onchange = e => { if (e.target.files[0]) loadZip(e.target.files[0]); e.target.value = ''; };
+  $('btnAddClass').onclick = () => addClass().catch(e => log(e.message));
+  $('inMax').onchange = () => { const v = parseFloat($('inMax').value); if (v > 0) { S.spec.max = v; S.spec.autoMax = false; } renderClasses(); };
+  $('chkAutoMax').onchange = () => { S.spec.autoMax = $('chkAutoMax').checked; renderClasses(); };
+  $('inUnit').onchange = () => { S.spec.unit = $('inUnit').value.trim() || 'cm'; renderClasses(); };
+  for (const id of ['inInput', 'inC1', 'inC2']) $(id).onchange = onLayoutChange;
+  $('btnCam').onclick = toggleCam; $('btnCap').onclick = () => captureOne().catch(e => log(e.message)); $('btnBurst').onclick = () => burst().catch(e => log(e.message));
+  $('chkMirror').onchange = mirrorPreview; $('chkVflip').onchange = mirrorPreview; mirrorPreview();
+  $('btnReview').onclick = openReview; $('selRevCls').onchange = openReview; $('chkSusp').onchange = openReview;
+  $('btnRevClose').onclick = () => $('rev').classList.remove('open'); $('btnRevPrev').onclick = () => revStep(-1); $('btnRevNext').onclick = () => revStep(1);
+  $('btnRevMark').onclick = () => revMark(false); $('btnRevDel').onclick = () => revDelete().catch(e => log(e.message));
+  $('btnInspClose').onclick = closeInspector;
+  $('btnInspDel').onclick = async () => { if (inspS && confirm(`Delete ${inspS.name}${S.dir ? ' from the SD card' : ''}?`)) { const s = inspS; closeInspector(); await deleteSamples([s]); } };
+  $('btnInspMove').onclick = async () => { if (inspS) { const s = inspS; await moveSample(s, +$('selInspMove').value); openInspector(s.id); } };
+  $('selHeatMode').onchange = () => { if (inspS) drawSample($('cvInsp'), inspS); }; $('chkOverlay').onchange = $('selHeatMode').onchange;
+  $('btnTrain').onclick = () => doTrain().catch(e => { log('Train error: ' + e.message); S.run.on = false; $('btnTrain').disabled = false; });
+  $('btnPause').onclick = () => { S.run.paused = !S.run.paused; $('btnPause').textContent = S.run.paused ? 'Resume' : 'Pause'; };
+  $('btnStop').onclick = () => { S.run.stop = true; S.run.paused = false; };
+  $('selValMode').onchange = () => { computeSplit(); }; $('inValN').onchange = () => { computeSplit(); };
+  $('btnEval').onclick = updateEval; $('selEval').onchange = updateEval; $('btnRefit').onclick = refitCalib; $('btnPar').onclick = parityTest;
+  $('btnLive').onclick = () => toggleLive().catch(e => { log(e.message); S.live = false; });
+  $('btnSaveW').onclick = () => saveWeights().catch(e => { log('Save failed: ' + e.message); alert('Save failed: ' + e.message); });
+  $('btnSaveCfg').onclick = () => saveConfig().catch(e => log(e.message)); $('btnSaveZip').onclick = () => saveZip().catch(e => log(e.message));
+  $('btnSerConn').onclick = serConnect; $('btnSerDisc').onclick = () => serDisconnect().catch(e => log(e.message));
+  $('chkDbg').onchange = () => { if (!writer) return; if ($('chkDbg').checked) hbStart(); else { hbStop(); serSend('d').catch(() => { }); } };
+  const send = () => { const t = $('serIn').value; if (writer) serSend(t + '\n').catch(e => log(e.message)); $('serIn').value = ''; };
+  $('btnSerSend').onclick = send; $('serIn').onkeydown = e => { if (e.key === 'Enter') send(); };
+  if (!HAS_FS) $('fsNote').textContent = 'This browser has no folder access: use Load .zip (desktop Chrome or Edge gives direct SD access).';
+  if (!('serial' in navigator)) $('serNote').textContent = 'Web Serial is not available in this browser (use desktop Chrome or Edge).';
+  syncLayoutInputs(); renderAll(); drawCharts(); updateEval();
+  log(`${VERSION} ready. Not tested here: real hardware, camera, microphone or phone.`);
+}
+init();
+
+</script>
+</body>
+</html>
