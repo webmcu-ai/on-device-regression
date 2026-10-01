@@ -2,6 +2,9 @@
 on device regression using the seeedstudio xiao esp32s3 sense in the form of the xiao ml kit
 
 
+Demo live webpage at https://webmcu-ai.github.io/on-device-regression/index.html
+
+
 Started May 14, 2026
 
 
